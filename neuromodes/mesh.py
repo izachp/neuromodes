@@ -6,11 +6,15 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Union, TYPE_CHECKING
 from lapy import TriaMesh, TetMesh
+from nibabel.affines import apply_affine
 from nibabel.gifti.gifti import GiftiImage
+from nibabel.loadsave import load
 import numpy as np
+from scipy.interpolate import griddata, Rbf
 from neuromodes.io import fs_extensions
 
 if TYPE_CHECKING:
+    from nibabel.nifti1 import Nifti1Image
     from numpy.typing import ArrayLike, NDArray
 
 def is_vol(
@@ -306,3 +310,190 @@ def check_surf(
     if not surf.is_manifold():
         raise ValueError('Surface mesh is not manifold: contains edges belonging to more than two '
                          'faces.')
+    
+def tetmesh_to_nifti(
+    data: ArrayLike,
+    tetmesh: TetMesh,
+    nifti_mask: Union[str, Path, Nifti1Image]
+) -> Nifti1Image:
+    """
+    Project data defined on a tetrahedral mesh to a volumetric NIFTI space.
+    
+    Parameters
+    ----------
+    nifti_mask : str, Path, or Nifti1Image
+        Input NIFTI file path or loaded Nifti1Image object defining the target volume space.
+    data : array-like
+        Data values defined on the vertices of the tetmesh (shape should be (n_vertices,))
+    tetmesh : lapy.TetMesh
+        The tetrahedral mesh on which the data is defined. Must have vertex coordinates similar to
+        the NIFTI space, after applying the appropriate affine transformation.
+    """
+    # Format / validate arguments
+    data = np.asarray_chkfinite(data)
+    if data.shape != (tetmesh.v.shape[0],):
+        raise ValueError(f"`data` must have shape ({tetmesh.v.shape[0]},), got {data.shape}.")
+    if not isinstance(tetmesh, TetMesh):
+        raise ValueError("`tetmesh` must be an instance of `lapy.TetMesh`.")
+    if isinstance(nifti_mask, (str, Path)):
+        nifti_mask = load(nifti_mask)
+    elif not isinstance(nifti_mask, Nifti1Image):
+        raise ValueError("nifti_mask must be a Nifti1Image object or a path-like string to a valid "
+                         "`.nii` or `.nii.gz` file.")
+    
+    # Get coordinates of nonzero voxels in physical space
+    x, y, z = np.asarray(nifti_mask.get_fdata() > 0).nonzero()
+    vox_coords = np.column_stack([x, y, z])
+    apply_affine(nifti_mask.affine, vox_coords, inplace=True)
+
+    # Initialise NIFTI array
+    interp_data = np.zeros(nifti_mask.shape, dtype=np.result_type(data, np.float32))
+
+    # Interpolate data and store at ROI coordinates
+    interp_data[x, y, z] = griddata(tetmesh.v, data, vox_coords, method='linear')
+
+    # Create a new NIFTI image with the interpolated values
+    header = nifti_mask.header.copy().set_data_dtype(interp_data.dtype)
+    return Nifti1Image(interp_data, nifti_mask.affine, header=header)
+
+def nifti_to_tetmesh(
+    nifti_data: Union[str, Path, Nifti1Image],
+    tetmesh: TetMesh,
+    nifti_mask: Union[str, Path, Nifti1Image, None] = None,
+    **rbf_kwargs
+) -> NDArray:
+    """
+    Project data from volumetric NIFTI space to a tetrahedral mesh using RBF interpolation.
+    
+    RBF (Radial Basis Function) interpolation is faster than griddata's linear method but
+    more stable than nearest-neighbor on mesh boundaries. This avoids the zeros at boundary
+    voxels that nearest-neighbor produces while being much faster than linear griddata.
+    
+    Parameters
+    ----------
+    nifti_data : str, Path, or Nifti1Image
+        Input NIFTI file path or loaded Nifti1Image object.
+    nifti_mask : str, Path, or Nifti1Image or None
+        Optional mask to define the region of interest. If None, nonzero voxels are used.
+    tetmesh : lapy.TetMesh
+        The tetrahedral mesh to which data is projected.
+    **rbf_kwargs
+        Additional keyword arguments to pass to `scipy.interpolate.Rbf`, such as `function` and
+        `smooth`.
+    
+    Returns
+    -------
+    interp_data : ndarray
+        Data interpolated at mesh vertices, shape (n_vertices,).
+    """
+    # Load NIFTI if needed
+    if isinstance(nifti_data, (str, Path)):
+        nifti_data = load(nifti_data)
+    elif not isinstance(nifti_data, Nifti1Image):
+        raise ValueError("nifti_data must be a Nifti1Image object or path")
+    
+    # Get mask
+    data = nifti_data.get_fdata()
+    if nifti_mask is None:
+        mask = data > 0
+    else:
+        if isinstance(nifti_mask, (str, Path)):
+            nifti_mask = load(nifti_mask)
+        mask = nifti_mask.get_fdata() > 0
+    
+    # Get voxel coordinates and values
+    x, y, z = np.where(mask)
+    vox_coords = np.column_stack([x, y, z])
+    apply_affine(nifti_data.affine, vox_coords, inplace=True)
+    
+    # Build RBF interpolator from voxel space
+    rbf = Rbf(vox_coords[:, 0], vox_coords[:, 1], vox_coords[:, 2], data[mask], **rbf_kwargs)
+    
+    # Evaluate at mesh vertices  
+    return rbf(tetmesh.v[:, 0], tetmesh.v[:, 1], tetmesh.v[:, 2])
+
+def make_vol_mesh(
+    vol: Union[str, Path, Nifti1Image]
+) -> TetMesh:
+    """
+    Tetrahedral meshing using Gmsh's python API and marching cubes algorithm.
+    Returns a lapy.TetMesh object.
+    """
+    import gmsh
+    from skimage.measure import marching_cubes
+    from nibabel.nifti1 import Nifti1Image
+
+    # Format / validate arguments
+    if isinstance(vol, (str, Path)):
+        vol = load(vol)
+    elif not isinstance(vol, Nifti1Image):
+        raise ValueError("vol must be a Nifti1Image object or a path-like string to a valid "
+                         "`.nii` or `.nii.gz` file.")
+    
+    # Get binary ROI from NIFTI
+    roi = (vol.get_fdata() > 0).astype(np.uint8)
+
+    # Marching cubes to extract smoothed surface (replacing mri_mc from FreeSurfer)
+    surf_verts, trias, _, _ = marching_cubes(roi, level=0.5, allow_degenerate=False)
+    apply_affine(vol.affine, surf_verts, inplace=True)
+    surf = TriaMesh(v=surf_verts, t=trias)
+
+    # match volume of mesh to ROI volume
+    roi_vol = np.sum(roi) * np.abs(np.linalg.det(vol.affine[:3, :3]))
+    surf_vol = surf.volume()
+    centroid = surf.centroid()
+    surf.v -= centroid
+    surf.v *= (roi_vol / surf_vol) ** (1/3)
+    surf.v += centroid
+
+    check_surf(surf)
+
+    # Gmsh tetrahedral meshing
+    gmsh.initialize()
+    gmsh.model.add("vol")
+
+    vert_tags = [gmsh.model.geo.addPoint(float(x), float(y), float(z)) for x, y, z in surf.v]
+    tria_tags = []
+    for f in trias:
+        l1 = gmsh.model.geo.addLine(vert_tags[f[0]], vert_tags[f[1]])
+        l2 = gmsh.model.geo.addLine(vert_tags[f[1]], vert_tags[f[2]])
+        l3 = gmsh.model.geo.addLine(vert_tags[f[2]], vert_tags[f[0]])
+
+        cl = gmsh.model.geo.addCurveLoop([l1, l2, l3])
+        s = gmsh.model.geo.addPlaneSurface([cl])
+        tria_tags.append(s)
+
+    sl = gmsh.model.geo.addSurfaceLoop(tria_tags)
+    gmsh.model.geo.addVolume([sl])
+    gmsh.model.geo.synchronize()
+
+    # Set mesh options according to BrainEigenmodes
+    gmsh.option.setNumber("Mesh.Algorithm3D", 4)
+    gmsh.option.setNumber("Mesh.Optimize", 1)
+    gmsh.option.setNumber("Mesh.OptimizeNetgen", 1)
+    
+    gmsh.model.mesh.generate(3)
+
+    # Get mesh data
+    verts = gmsh.model.mesh.getNodes()[1].reshape(-1, 3)
+    etypes, _, elems = gmsh.model.mesh.getElements()
+    tetras = None
+    for etype, nodes in zip(etypes, elems):
+        if etype == 4:  # Gmsh tetrahedron element type
+            tetras = nodes.reshape(-1, 4) - 1  # Convert to 0-based indexing
+            break
+
+    # Cleanup API
+    gmsh.finalize()
+
+    if tetras is None:
+        raise RuntimeError("Gmsh did not generate any tetrahedra. Check if the input surface is"
+                           "closed and valid.")
+
+    # Convert to lapy
+    mesh = TetMesh(v=verts.astype(np.float64), t=tetras.astype(np.int32))
+
+    # Ensure the generated volume mesh is valid
+    check_vol(mesh)
+
+    return mesh
