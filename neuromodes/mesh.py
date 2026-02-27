@@ -5,16 +5,17 @@ Module for reading, validating, manipulating, and creating meshes of brain struc
 from __future__ import annotations
 from pathlib import Path
 from typing import Union, TYPE_CHECKING
+from warnings import warn
 from lapy import TriaMesh, TetMesh
 from nibabel.affines import apply_affine
+from nibabel.nifti1 import Nifti1Image
 from nibabel.gifti.gifti import GiftiImage
 from nibabel.loadsave import load
 import numpy as np
-from scipy.interpolate import griddata, Rbf
+from scipy.interpolate import griddata, RBFInterpolator
 from neuromodes.io import fs_extensions
 
 if TYPE_CHECKING:
-    from nibabel.nifti1 import Nifti1Image
     from numpy.typing import ArrayLike, NDArray
 
 def is_vol(
@@ -314,7 +315,8 @@ def check_surf(
 def tetmesh_to_nifti(
     data: ArrayLike,
     tetmesh: TetMesh,
-    nifti_mask: Union[str, Path, Nifti1Image]
+    nifti_mask: Union[str, Path, Nifti1Image],
+    **rbf_kwargs
 ) -> Nifti1Image:
     """
     Project data defined on a tetrahedral mesh to a volumetric NIFTI space.
@@ -344,13 +346,19 @@ def tetmesh_to_nifti(
     # Get coordinates of nonzero voxels in physical space
     x, y, z = np.asarray(nifti_mask.get_fdata() > 0).nonzero()
     vox_coords = np.column_stack([x, y, z])
-    apply_affine(nifti_mask.affine, vox_coords, inplace=True)
+    vox_coords = apply_affine(nifti_mask.affine, vox_coords)
 
     # Initialise NIFTI array
     interp_data = np.zeros(nifti_mask.shape, dtype=np.result_type(data, np.float32))
 
-    # Interpolate data and store at ROI coordinates
+    # Linear interpolation within convex hull of vertices, store at ROI coordinates
     interp_data[x, y, z] = griddata(tetmesh.v, data, vox_coords, method='linear')
+
+    # Use Rbf to interpolate at any voxels outside the convex hull (griddata returns NaNs)
+    nan_mask = np.isnan(interp_data)
+    if np.any(nan_mask):
+        rbf = RBFInterpolator(tetmesh.v, data, **rbf_kwargs)
+        interp_data[nan_mask] = rbf(vox_coords[nan_mask])
 
     # Create a new NIFTI image with the interpolated values
     header = nifti_mask.header.copy().set_data_dtype(interp_data.dtype)
@@ -378,8 +386,8 @@ def nifti_to_tetmesh(
     tetmesh : lapy.TetMesh
         The tetrahedral mesh to which data is projected.
     **rbf_kwargs
-        Additional keyword arguments to pass to `scipy.interpolate.Rbf`, such as `function` and
-        `smooth`.
+        Additional keyword arguments to pass to `scipy.interpolate.RBFInterpolator`, such as 
+        `function` and `smooth`.
     
     Returns
     -------
@@ -404,16 +412,23 @@ def nifti_to_tetmesh(
     # Get voxel coordinates and values
     x, y, z = np.where(mask)
     vox_coords = np.column_stack([x, y, z])
-    apply_affine(nifti_data.affine, vox_coords, inplace=True)
+    vox_coords = apply_affine(nifti_data.affine, vox_coords)
     
-    # Build RBF interpolator from voxel space
-    rbf = Rbf(vox_coords[:, 0], vox_coords[:, 1], vox_coords[:, 2], data[mask], **rbf_kwargs)
-    
-    # Evaluate at mesh vertices  
-    return rbf(tetmesh.v[:, 0], tetmesh.v[:, 1], tetmesh.v[:, 2])
+    # Linear interpolation within convex hull of ROI coordinates, store at mesh vertices
+    interp_data = griddata(vox_coords, data[mask], tetmesh.v, method='linear')
+
+    # Use Rbf to interpolate at any vertices outside the convex hull (griddata returns NaNs)
+    nan_mask = np.isnan(interp_data)
+    if np.any(nan_mask):
+        rbf = RBFInterpolator(vox_coords, data[mask], **rbf_kwargs)
+        interp_data[nan_mask] = rbf(tetmesh.v[nan_mask])
+
+    return interp_data
 
 def make_vol_mesh(
-    vol: Union[str, Path, Nifti1Image]
+    vol: Union[str, Path, Nifti1Image],
+    closings: int = 0,
+    discard_components: bool = False
 ) -> TetMesh:
     """
     Tetrahedral meshing using Gmsh's python API and marching cubes algorithm.
@@ -421,7 +436,7 @@ def make_vol_mesh(
     """
     import gmsh
     from skimage.measure import marching_cubes
-    from nibabel.nifti1 import Nifti1Image
+    from scipy.ndimage import binary_closing
 
     # Format / validate arguments
     if isinstance(vol, (str, Path)):
@@ -429,37 +444,49 @@ def make_vol_mesh(
     elif not isinstance(vol, Nifti1Image):
         raise ValueError("vol must be a Nifti1Image object or a path-like string to a valid "
                          "`.nii` or `.nii.gz` file.")
+    if closings != int(closings) or closings < 0:
+        raise ValueError("Parameter `closings` must be a non-negative integer.")
     
     # Get binary ROI from NIFTI
     roi = (vol.get_fdata() > 0).astype(np.uint8)
+    if closings:
+        roi = binary_closing(roi, iterations=closings)
 
     # Marching cubes to extract smoothed surface (replacing mri_mc from FreeSurfer)
     surf_verts, trias, _, _ = marching_cubes(roi, level=0.5, allow_degenerate=False)
-    apply_affine(vol.affine, surf_verts, inplace=True)
+    surf_verts = apply_affine(vol.affine, surf_verts)
     surf = TriaMesh(v=surf_verts, t=trias)
-
-    # match volume of mesh to ROI volume
-    roi_vol = np.sum(roi) * np.abs(np.linalg.det(vol.affine[:3, :3]))
-    surf_vol = surf.volume()
-    centroid = surf.centroid()
-    surf.v -= centroid
-    surf.v *= (roi_vol / surf_vol) ** (1/3)
-    surf.v += centroid
-
-    check_surf(surf)
+    
+    # Handle disconnected components in generated surface
+    n_components, labels = surf.connected_components()
+    if n_components > 1:
+        if discard_components:
+            surf.keep_largest_connected_component_()
+            print(f"Components discarded: {n_components-1}.")
+            unique, counts = np.unique(labels, return_counts=True)
+            for comp, count in zip(unique, counts):
+                if comp != np.argmax(np.bincount(labels)):
+                    print(f"    - {count} vertices.")
+        else:
+            warn(f"Generated surface has {n_components} connected components; unable to proceed "
+                 "with tetrahedral meshing. Surface mesh will be returned with labels array to "
+                 "allow visual inspection. Consider using `discard_components` to keep only the "
+                 "largest component, or `closings` to fill small holes and merge disconnected "
+                 "pieces.")
+            return surf, labels
 
     # Gmsh tetrahedral meshing
     gmsh.initialize()
     gmsh.model.add("vol")
 
-    vert_tags = [gmsh.model.geo.addPoint(float(x), float(y), float(z)) for x, y, z in surf.v]
+    vert_tags = [gmsh.model.geo.addPoint(x, y, z) for x, y, z in surf.v]
     tria_tags = []
-    for f in trias:
-        l1 = gmsh.model.geo.addLine(vert_tags[f[0]], vert_tags[f[1]])
-        l2 = gmsh.model.geo.addLine(vert_tags[f[1]], vert_tags[f[2]])
-        l3 = gmsh.model.geo.addLine(vert_tags[f[2]], vert_tags[f[0]])
+    for tria in surf.t:
+        e1 = gmsh.model.geo.addLine(vert_tags[tria[0]], vert_tags[tria[1]])
+        e2 = gmsh.model.geo.addLine(vert_tags[tria[1]], vert_tags[tria[2]])
+        e3 = gmsh.model.geo.addLine(vert_tags[tria[2]], vert_tags[tria[0]])
 
-        cl = gmsh.model.geo.addCurveLoop([l1, l2, l3])
+        cl = gmsh.model.geo.addCurveLoop([e1, e2, e3])
         s = gmsh.model.geo.addPlaneSurface([cl])
         tria_tags.append(s)
 
@@ -471,7 +498,6 @@ def make_vol_mesh(
     gmsh.option.setNumber("Mesh.Algorithm3D", 4)
     gmsh.option.setNumber("Mesh.Optimize", 1)
     gmsh.option.setNumber("Mesh.OptimizeNetgen", 1)
-    
     gmsh.model.mesh.generate(3)
 
     # Get mesh data
