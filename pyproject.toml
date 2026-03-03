@@ -28,6 +28,7 @@ vol = [
     "h5py>=3.14.0",
     "nbformat>=5.10.4",
     "nilearn>=0.12.1",
+    "pyvista>=0.46.5",
     "scikit-image>=0.24.0",
     "tetgen>=0.7.0",
     "trimesh>=4.11.2",

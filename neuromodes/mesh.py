@@ -316,6 +316,7 @@ def tetmesh_to_nifti(
     data: ArrayLike,
     tetmesh: TetMesh,
     nifti_mask: Union[str, Path, Nifti1Image],
+    method: str = 'nearest',
     **rbf_kwargs
 ) -> Nifti1Image:
     """
@@ -352,7 +353,7 @@ def tetmesh_to_nifti(
     interp_data = np.zeros(nifti_mask.shape, dtype=np.result_type(data, np.float32))
 
     # Linear interpolation within convex hull of vertices, store at ROI coordinates
-    interp_data[x, y, z] = griddata(tetmesh.v, data, vox_coords, method='linear')
+    interp_data[x, y, z] = griddata(tetmesh.v, data, vox_coords, method=method)
 
     # Use Rbf to interpolate at any voxels outside the convex hull (griddata returns NaNs)
     nan_mask = np.isnan(interp_data)
@@ -428,7 +429,9 @@ def nifti_to_tetmesh(
 def make_vol_mesh(
     vol: Union[str, Path, Nifti1Image],
     closings: int = 0,
-    discard_components: bool = False
+    discard_components: bool = False,
+    method: str = 'gmsh',
+    **tetgen_kwargs
 ) -> TetMesh:
     """
     Tetrahedral meshing using Gmsh's python API and marching cubes algorithm.
@@ -437,6 +440,7 @@ def make_vol_mesh(
     import gmsh
     from skimage.measure import marching_cubes
     from scipy.ndimage import binary_closing
+    from tetgen import TetGen
 
     # Format / validate arguments
     if isinstance(vol, (str, Path)):
@@ -475,46 +479,67 @@ def make_vol_mesh(
                  "pieces.")
             return surf, labels
 
-    # Gmsh tetrahedral meshing
-    gmsh.initialize()
-    gmsh.model.add("vol")
+    # Ensure that surface is closed and manifold
+    if not surf.is_closed():
+        raise ValueError("Generated surface mesh is not closed. Consider using `closings` to fill "
+                         "small holes and merge disconnected pieces.")
+    if not surf.is_manifold():
+        raise ValueError("Generated surface mesh is not manifold: contains edges belonging to more "
+                         "than two faces. Consider using `closings` to fill small holes and merge "
+                         "disconnected pieces.")
+        
+    if method == 'gmsh':
+        gmsh.initialize()
+        gmsh.model.add("vol")
 
-    vert_tags = [gmsh.model.geo.addPoint(x, y, z) for x, y, z in surf.v]
-    tria_tags = []
-    for tria in surf.t:
-        e1 = gmsh.model.geo.addLine(vert_tags[tria[0]], vert_tags[tria[1]])
-        e2 = gmsh.model.geo.addLine(vert_tags[tria[1]], vert_tags[tria[2]])
-        e3 = gmsh.model.geo.addLine(vert_tags[tria[2]], vert_tags[tria[0]])
+        # Add surface vertices
+        vert_tags = [gmsh.model.geo.addPoint(x, y, z) for x, y, z in surf.v]
+        tria_tags = []
+        for tria in surf.t:
+            e1 = gmsh.model.geo.addLine(vert_tags[tria[0]], vert_tags[tria[1]])
+            e2 = gmsh.model.geo.addLine(vert_tags[tria[1]], vert_tags[tria[2]])
+            e3 = gmsh.model.geo.addLine(vert_tags[tria[2]], vert_tags[tria[0]])
 
-        cl = gmsh.model.geo.addCurveLoop([e1, e2, e3])
-        s = gmsh.model.geo.addPlaneSurface([cl])
-        tria_tags.append(s)
+            cl = gmsh.model.geo.addCurveLoop([e1, e2, e3])
+            s = gmsh.model.geo.addPlaneSurface([cl])
+            tria_tags.append(s)
 
-    sl = gmsh.model.geo.addSurfaceLoop(tria_tags)
-    gmsh.model.geo.addVolume([sl])
-    gmsh.model.geo.synchronize()
+        sl = gmsh.model.geo.addSurfaceLoop(tria_tags)
+        gmsh.model.geo.addVolume([sl])
+        gmsh.model.geo.synchronize()
 
-    # Set mesh options according to BrainEigenmodes
-    gmsh.option.setNumber("Mesh.Algorithm3D", 4)
-    gmsh.option.setNumber("Mesh.Optimize", 1)
-    gmsh.option.setNumber("Mesh.OptimizeNetgen", 1)
-    gmsh.model.mesh.generate(3)
+        # Set mesh options according to BrainEigenmodes
+        gmsh.option.setNumber("Mesh.Algorithm3D", 4)
+        gmsh.option.setNumber("Mesh.Optimize", 1)
+        gmsh.option.setNumber("Mesh.OptimizeNetgen", 1)
+        gmsh.model.mesh.generate(3)
 
-    # Get mesh data
-    verts = gmsh.model.mesh.getNodes()[1].reshape(-1, 3)
-    etypes, _, elems = gmsh.model.mesh.getElements()
-    tetras = None
-    for etype, nodes in zip(etypes, elems):
-        if etype == 4:  # Gmsh tetrahedron element type
-            tetras = nodes.reshape(-1, 4) - 1  # Convert to 0-based indexing
-            break
+        # Get mesh data
+        verts = gmsh.model.mesh.getNodes()[1].reshape(-1, 3)
+        etypes, _, elems = gmsh.model.mesh.getElements()
+        tetras = None
+        for etype, nodes in zip(etypes, elems):
+            if etype == 4:  # Gmsh tetrahedron element type
+                tetras = nodes.reshape(-1, 4) - 1  # Convert to 0-based indexing
+                break
 
-    # Cleanup API
-    gmsh.finalize()
+        # Cleanup API
+        gmsh.finalize()
 
-    if tetras is None:
-        raise RuntimeError("Gmsh did not generate any tetrahedra. Check if the input surface is"
-                           "closed and valid.")
+        if tetras is None:
+            raise RuntimeError("Gmsh did not generate any tetrahedra. Check if the input surface is"
+                               "closed and valid.")
+    elif method == 'tetgen':
+        # Append vertices from marching cubes with voxel centers
+        vox_coords = np.column_stack(np.nonzero(roi))
+        vox_coords = apply_affine(vol.affine, vox_coords)
+        init_verts = np.vstack([surf.v, vox_coords])
+
+        # Generate edges to complete tetrahedral mesh
+        tetgen = TetGen(init_verts, surf.t)
+        tetgen.tetrahedralize(**tetgen_kwargs)
+        verts = tetgen.node
+        tetras = tetgen.elem
 
     # Convert to lapy
     mesh = TetMesh(v=verts.astype(np.float64), t=tetras.astype(np.int32))
