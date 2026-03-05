@@ -194,8 +194,8 @@ def simulate_waves(
 
 def bold_transform(
     activity: ArrayLike,
-    emodes: ArrayLike,
     dt: float,
+    emodes: ArrayLike,
     pde_method: str = "fourier",
     decomp_method: str = "project",
     mass: Union[spmatrix, ArrayLike, None] = None,
@@ -296,8 +296,7 @@ def calc_wave_speed(
     Returns
     -------
     float or np.ndarray
-        Wave speed across the whole surface, or at each cortical vertex if `scaled_hetero` is
-        provided.
+        Wave speed across the whole cortex, or at each vertex if `scaled_hetero` is provided.
     """
     speed = (r / 1000) * gamma # Convert r to meters
     if scaled_hetero is not None:
@@ -786,3 +785,33 @@ def _solve_fem_freq(
 ) -> NDArray:
     """Helper function for parallel frequency solves."""
     return linalg.splu(operator).solve(input)
+
+def _analytical_fc(
+    emodes: NDArray,
+    evals: NDArray,
+    r: float,
+    gamma: float
+) -> NDArray:
+    """
+    Calculate the analytical FC for the wave model.
+
+    Parameters
+    ----------
+    emodes : np.ndarray
+        Eigenmodes of shape (n_verts, n_modes).
+    evals : np.ndarray
+        Eigenvalues corresponding to the modes, with shape (n_modes,).
+    r : float
+        Spatial length scale of wave propagation in millimeters.
+    gamma : float
+        Damping rate of wave propagation in seconds^-1.
+
+    Returns
+    -------
+    np.ndarray
+        Analytical FC matrix of shape (n_verts, n_verts).
+    """
+    mode_vars = 1.0 / (2 * gamma * (1 + r**2 * evals))
+    cov = emodes @ np.diag(mode_vars) @ emodes.T
+    diag = np.sqrt(np.diag(cov))
+    return cov / diag[:, np.newaxis] / diag[np.newaxis, :]
