@@ -89,8 +89,7 @@ class EigenSolver(Solver):
 
         # Optionally mask
         if mask is not None:
-            mask = np.asarray(mask, dtype=bool)  # chkfinite in mask_mesh
-            geometry = mask_mesh(geometry, mask)
+            geometry, mask = mask_mesh(geometry, mask, return_mask=True)
 
         # Optionally normalize
         if normalize:
@@ -201,8 +200,8 @@ class EigenSolver(Solver):
         standardize: bool = True,
         fix_mode1: bool = True,
         lump: bool = False,
-        atol: float = 1e-3,
-        rtol: float = 1e-5,
+        atol: float | None = 1e-3,
+        rtol: float | None = 1e-5,
         sigma: float | None = -0.01,
         seed: int | Generator | None = None, 
         v0: ArrayLike | None = None
@@ -272,7 +271,8 @@ class EigenSolver(Solver):
         evals, emodes = self.eigs(k=n_modes, sigma=sigma, v0=v0, rng=seed)
 
         # Validate results
-        if not is_orthonormal_basis(emodes, self.mass, atol=atol, rtol=rtol, checks=False):
+        if (atol is not None and rtol is not None # TODO: implement properly, perhaps a single tols tuple?
+            and not is_orthonormal_basis(emodes, self.mass, atol=atol, rtol=rtol, checks=False)):
             warn(f"Computed eigenmodes are not mass-orthonormal (atol={atol}, rtol={rtol}).")
 
         ## Post-process
@@ -446,6 +446,23 @@ class EigenSolver(Solver):
             evals=self.evals,
             mass=self.mass,
             checks=False,
+            **kwargs
+        )
+
+    def make_parcellation(
+        self,
+        n_parcels: int,
+        **kwargs
+    ) -> NDArray:
+        """
+        This is a wrapper for :func:`~neuromodes.parc.make_parcellation`. Note that `geometry` is
+        passed automatically by the `EigenSolver` instance.
+        """
+        from neuromodes.parc import make_parcellation
+
+        return make_parcellation(
+            geometry=self.geometry,
+            n_parcels=n_parcels,
             **kwargs
         )
 

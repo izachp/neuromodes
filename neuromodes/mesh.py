@@ -4,6 +4,7 @@ Module for reading, validating, manipulating, and creating meshes of brain struc
 
 from __future__ import annotations
 from typing import TYPE_CHECKING
+from warnings import warn
 from lapy import TriaMesh
 import numpy as np
 
@@ -12,8 +13,9 @@ if TYPE_CHECKING:
 
 def mask_mesh(
     geometry: TriaMesh,
-    mask: ArrayLike
-) -> TriaMesh:
+    mask: ArrayLike,
+    return_mask: bool = False
+) -> TriaMesh | tuple[TriaMesh, NDArray[np.bool_]]:
     """
     Remove specified vertices and corresponding elements from a triangular surface mesh. Returns a
     ``lapy.TriaMesh`` object.
@@ -24,11 +26,16 @@ def mask_mesh(
         The input surface or volume mesh.
     mask : array-like
         A boolean array indicating which vertices to keep (``True``) or remove (``False``).
+    return_mask : bool, optional
+        If ``True``, also return the effective full-length boolean mask after dropping any
+        unreferenced kept vertices. Default is ``False``.
 
     Returns
     -------
-    lapy.TriaMesh or lapy.TetMesh
-        The masked surface or volume mesh.
+    lapy.TriaMesh or lapy.TetMesh or tuple
+        The masked mesh. If ``return_mask`` is ``True``, returns
+        ``(masked_mesh, effective_mask)`` where ``effective_mask`` has the same length as the
+        input ``mask`` and marks vertices that survived masking and face filtering.
 
     Raises
     ------
@@ -41,20 +48,43 @@ def mask_mesh(
         raise ValueError(f"mask must have shape ({geometry.v.shape[0]},), matching the number of "
                          "vertices in geometry.")
 
+    # Track effective mask in original vertex space for downstream use.
+    effective_mask = mask.copy()
+
     # Remove vertices not in mask
-    v_masked = geometry.v[mask].astype(np.float64)
+    v_masked = geometry.v[effective_mask].astype(np.float64)
 
     # Update vertex indices of elements (-1 represents removed vertices)
-    v_map = np.full(len(mask), -1, dtype=int)
-    v_map[mask] = np.arange(np.sum(mask))
+    v_map = np.full(len(effective_mask), -1, dtype=int)
+    v_map[effective_mask] = np.arange(np.sum(effective_mask))
     t_remapped = v_map[geometry.t]
     
     # Keep only elements where all vertices are in the mask
     elem_mask = np.all(t_remapped != -1, axis=1)
     t_masked = t_remapped[elem_mask]
 
+    # Remove unreferenced vertices (vertices in the mask but not part of any kept face)
+    if len(t_masked) > 0:
+        referenced = np.zeros(len(v_masked), dtype=bool)
+        referenced[t_masked] = True
+        if not np.all(referenced):
+            warn(f'{np.sum(~referenced)} vertices in the mask are not part of any kept element and '
+                 'will be removed.')
+            # Create mapping from old to new vertex indices
+            v_remap = np.full(len(v_masked), -1, dtype=int)
+            v_remap[referenced] = np.arange(np.sum(referenced))
+            v_masked = v_masked[referenced]
+            t_masked = v_remap[t_masked]
+
+            # Update effective full-length mask for downstream use.
+            # `referenced` is in masked-vertex space, so map it back to original-vertex space.
+            effective_mask[effective_mask] = referenced
+
     # Create a new TriaMesh or TetMesh with the masked vertices and elements
-    return geometry.__class__(v=v_masked, t=t_masked)
+    masked_geometry = geometry.__class__(v=v_masked, t=t_masked)
+    if return_mask:
+        return masked_geometry, effective_mask
+    return masked_geometry
 
 def unmask_data(
     data: ArrayLike,
