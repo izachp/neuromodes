@@ -18,6 +18,7 @@ if TYPE_CHECKING:
     from numpy import floating
     from numpy.random import Generator
     from numpy.typing import NDArray, ArrayLike
+    from plotly.graph_objs import Figure
 
 class EigenSolver(Solver):
     """
@@ -86,6 +87,8 @@ class EigenSolver(Solver):
     ):
         # Read in surface mesh
         geometry = read_surf(geometry)
+
+        self.raw_geometry = geometry  # For plotting method
 
         # Optionally mask
         if mask is not None:
@@ -463,6 +466,28 @@ class EigenSolver(Solver):
         return make_parcellation(
             geometry=self.geometry,
             n_parcels=n_parcels,
+            hetero=self.hetero,
+            alpha=self._alpha,
+            scaling=self._scaling,
+            **kwargs
+        )
+
+    def plot(
+        self,
+        data: ArrayLike,
+        **kwargs
+    ) -> Figure:
+
+        from neuromodes.mesh import unmask_data
+        from neuromodes.TEMP_utils import plot_mesh_data
+
+        # Unmask data if masked mesh
+        if self.mask is not None and data.shape[0] == self.mask.sum():
+            data = unmask_data(data, self.mask)
+
+        return plot_mesh_data(
+            geometry=self.raw_geometry,
+            data=data,
             **kwargs
         )
 

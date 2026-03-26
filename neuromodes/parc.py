@@ -12,66 +12,85 @@ def make_parcellation(
     geometry: TriaMesh,
     n_parcels: int,
     method: str = 'mode2',
-    seed: int | None = None
+    seed: int | None = None,
+    **hetero_kwargs
 ) -> NDArray[integer]:
-    # TODO: see how James' and GMH's functions implement this and handle idiosyncracies
-    # TODO: bugfix mode3 method
+    # TODO: debug unreferenced vertices being excluded from both daughter parcels
     # TODO: support list of n_parcels, return parcellations along columns
-    # TODO: support GMH's equal area method
-    # TODO: support whatever Jace's method is
+    # TODO: support GMH's equal area method (sort tria areas by mode2, split at median, repeat)
+    # TODO: support whatever Jace's method is (Voronoi?)
     # TODO: support custom method via Callable that takes geometry and mask and returns grad and
     # rank
     # TODO: profile speed when inserting evals/emodes/masks into list according to eval and removing
-    # argmin call
+    # argmin call (or just delete parent -> append daughters -> use first element as evals should
+    # come sorted as is? but maybe not if heterogeneity is involved?)
+    # TODO: precompute initialisation vector and reuse masked versions?
+    # TODO: test behaviour for n_parcels = n_verts
 
     # Format / validate arguments
-    if method not in ['mode2', 'mode3']:
-        raise ValueError("Method must be 'mode2' or 'mode3'.")
+    if method not in ['mode2']:
+        raise ValueError("Method must be 'mode2'.")
     if n_parcels < 2 or n_parcels > geometry.v.shape[0] or int(n_parcels) != n_parcels:
         raise ValueError(f"n_parcels must be an integer in the range [2, {geometry.v.shape[0]}].")
-    
-    n_modes = 2 if method == 'mode2' else 3
-    solver = EigenSolver(geometry).solve(n_modes, fix_mode1=False, seed=seed)
+
+    n_modes = 2
+
+    # unpack heterogeneity kwargs for EigenSolver if applicable
+    solver = EigenSolver(geometry, **hetero_kwargs).solve(n_modes, fix_mode1=False,
+                                                          standardize=False, seed=seed)
+
+    alpha = hetero_kwargs.get('alpha', None)
+    scaling = hetero_kwargs.get('scaling', None)
 
     # Initialise arrays
-    mask = np.zeros(geometry.v.shape[0], dtype=bool)
-    parc_masks = [np.ones_like(mask)]
+    empty_mask = np.zeros(geometry.v.shape[0], dtype=bool)
+    parc_masks = [np.ones_like(empty_mask)]
     parc_grads = [solver.emodes[:, -1]]
-    parc_rank = [solver.evals[-1]]
+    parc_ranks = [solver.evals[-1]]
     pangcellation = np.ones(geometry.v.shape[0], dtype=int)
 
     for i in range(1, n_parcels):
         # find index of smallest eigenvalue across all submeshes
-        idx = np.argmin(parc_rank)
+        idx = np.argmin(parc_ranks)
 
         # get corresponding data
-        mask = parc_masks[idx]
-        grad = parc_grads[idx]
-
-        pos_grad = grad > 0
+        mask_parent = parc_masks[idx]
+        pos_grad = parc_grads[idx] > 0
 
         # create new masks for daughter parcels
-        mask_a = mask.copy()
-        mask_b = mask.copy()
-        mask_a[mask] = pos_grad
-        mask_b[mask] = ~pos_grad
+        mask_a = empty_mask.copy()
+        
+        mask_a[mask_parent] = pos_grad
+
+        submesh_a, mask_a = mask_mesh(geometry, mask_a, return_mask=True)
+
+        mask_b = empty_mask.copy()
+        #mask_b[mask_parent] = ~pos_grad
+        mask_b[mask_parent & ~mask_a] = True
+        submesh_b, mask_b = mask_mesh(geometry, mask_b, return_mask=True)
 
         # update pangcellation with new parcel labels
         pangcellation[mask_a] = i + 1
 
         if i == n_parcels - 1:
-            return pangcellation, mask_a, mask_b
+            return pangcellation
+
+        # Get heterogeneity values for daughters if applicable
+        hetero_a = hetero_kwargs['hetero'][mask_a] if solver.hetero is not None else None
+        hetero_b = hetero_kwargs['hetero'][mask_b] if solver.hetero is not None else None
 
         # Compute eigenmode and eigenvalue of each daughter submesh
-        solver_a = EigenSolver(geometry, mask=mask_a).solve(n_modes, fix_mode1=False,
-                                                            standardize=False, atol=None, seed=seed)
-        solver_b = EigenSolver(geometry, mask=mask_b).solve(n_modes, fix_mode1=False,
-                                                            standardize=False, atol=None, seed=seed)
+        solver_a = EigenSolver(
+            submesh_a, hetero=hetero_a, alpha=alpha, scaling=scaling
+            ).solve(n_modes, fix_mode1=False, standardize=False, atol=None, seed=seed)
+        solver_b = EigenSolver(
+            submesh_b, hetero=hetero_b, alpha=alpha, scaling=scaling
+            ).solve(n_modes, fix_mode1=False, standardize=False, atol=None, seed=seed)
 
         # Replace parent data with one daughter, and add other daughter to list
-        parc_masks[idx] = solver_a.mask
+        parc_masks[idx] = mask_a
         parc_grads[idx] = solver_a.emodes[:, -1]
-        parc_rank[idx] = solver_a.evals[-1]
-        parc_masks.append(solver_b.mask)
+        parc_ranks[idx] = solver_a.evals[-1]
+        parc_masks.append(mask_b)
         parc_grads.append(solver_b.emodes[:, -1])
-        parc_rank.append(solver_b.evals[-1])
+        parc_ranks.append(solver_b.evals[-1])

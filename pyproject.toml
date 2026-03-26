@@ -10,6 +10,8 @@ dependencies = [
     "lapy>=1.6.0",
     "nibabel>=5.2.1",
     "numpy>=1.24.4",
+    "pillow>=12.1.1",
+    "plotly[kaleido]>=6.6.0",
     "scipy>=1.10.1",
 ]
 
