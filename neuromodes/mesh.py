@@ -5,12 +5,14 @@ Module for reading, validating, manipulating, and creating meshes of brain struc
 from __future__ import annotations
 from typing import TYPE_CHECKING
 import numpy as np
+from scipy.sparse.linalg import spsolve
 
 if TYPE_CHECKING:
     from typing import TypeVar
     from numpy import bool_
     from numpy.typing import NDArray
     from lapy import TriaMesh, TetMesh
+    from scipy.sparse import csc_matrix
     MeshType = TypeVar('MeshType', TriaMesh, TetMesh)
 
 def mask_mesh(
@@ -151,3 +153,47 @@ def check_surf(
     if not surf.is_manifold():
         raise ValueError('Surface mesh is not manifold: contains edges belonging to more than two '
                          'faces.')
+
+def smooth(
+    data: NDArray[np.floating],
+    mass: csc_matrix,
+    stiffness: csc_matrix,
+    dt: float,  # TODO: convert to FWHM or similar
+    checks: bool = True
+) -> NDArray[np.floating]:
+    """
+    Smooth data on a surface mesh using the implicit Euler method.
+
+    Parameters
+    ----------
+    data : numpy.ndarray
+        The data to be smoothed, of shape ``(n_verts,)`` or ``(n_verts, n_maps)``. TODO: support nD
+    mass : scipy.sparse.csc_matrix
+        The mass matrix of the mesh.
+    stiffness : scipy.sparse.csc_matrix
+        The stiffness matrix of the mesh.
+    dt : float
+        The time step for smoothing. Larger values will result in more smoothing.
+
+    Returns
+    -------
+    numpy.ndarray
+        The smoothed data, of the same shape as the input ``data``.
+    """
+    from neuromodes.eigen import EigenData  # avoid circular import
+
+    # Prelims
+    if checks is not False:
+        ved = EigenData(data=data, mass=mass, stiffness=stiffness, checks=checks)
+        data, mass, stiffness = ved.data, ved.mass, ved.stiffness
+
+    if (is_data_vec := (data.ndim == 1)):
+        data = data[:, np.newaxis]
+
+    # Smooth each map
+    for i in range(data.shape[1]):
+        # Solve (M + S) x = M @ data for x (the smoothed map)
+        A = mass + stiffness * dt
+        b = mass @ data[:, i]
+        data[:, i] = spsolve(A, b)
+    return data.squeeze(axis=1) if is_data_vec else data
