@@ -300,8 +300,7 @@ class EigenSolver(Solver):
     def inpaint(
         self,
         data: NDArray[floating],
-        method: Literal['harmonic', 'biharmonic', 'nearest'] = 'biharmonic',  # TODO: add RBF?
-        smoothing_fwhm: float | None = None
+        method: Literal['harmonic', 'biharmonic', 'nearest'] = 'biharmonic',  # TODO: add kriging/etc
     ) -> NDArray[floating]:
         """
         Inpaints missing values (NaNs) in the provided brain map(s).
@@ -350,11 +349,6 @@ class EigenSolver(Solver):
 
         masks = ~np.isnan(data)  # TODO: test behaviour of each method when a nanless map is present
 
-        # Compute required arrays
-        if method in ['harmonic', 'biharmonic']:
-            lump = (method == 'biharmonic')
-            self.compute_lbo(lump=lump)  # TODO: maybe just error if mass is not computed or not lumped?
-
         if method == 'nearest': # TODO: validate nearest neighbour method
             from scipy.sparse import csr_matrix, coo_matrix
             from scipy.sparse.csgraph import dijkstra
@@ -364,12 +358,8 @@ class EigenSolver(Solver):
             edge_graph = coo_matrix((weights, (rows, cols)), shape=(self.n_verts, self.n_verts))
 
         elif method == 'biharmonic':
-            from scipy.sparse.linalg import spsolve
-            from scipy.sparse import diags
-            
-            # Construct the biharmonic operator K @ M^-1 @ K
-            M_inv = diags(1.0 / self.mass.diagonal())
-            op = (self.stiffness @ M_inv @ self.stiffness).tocsr()
+            from scipy.sparse.linalg import splu
+            from scipy.sparse import hstack, vstack, csc_matrix
 
         # Inpaint each map (TODO: vectorize over common NaN patterns (LaPy PR?))
         data_out = data.copy()
@@ -385,15 +375,25 @@ class EigenSolver(Solver):
             elif method == 'biharmonic':
                 mask = masks[:, i]
                 
-                # Extract submatrices (square matrix for unknown verts, rectangular for connections)
-                op_uu = op[~mask, :][:, ~mask]
-                op_uk = op[~mask, :][:,  mask]
+                # Construct block matrix operator
+                n_unknown = np.sum(~mask)
+                zeros = csc_matrix((n_unknown, n_unknown))
+                stiffness_uk = -self.stiffness[:, ~mask]
+                block = vstack([
+                    hstack([self.mass, stiffness_uk], format='csc'),
+                    hstack([stiffness_uk.T,   zeros], format='csc')
+                    ], format='csc')
+
+                # Construct right-hand side boundary condition vector
+                rhs = np.concatenate([
+                    self.stiffness[:, mask] @ data[mask, i],
+                    np.zeros(n_unknown)
+                    ])
                 
-                # Convert Dirichlet boundary conditions into source term
-                rhs = -op_uk @ data[mask, i]
-                
-                # Solve linear system
-                data_out[~mask, i] = spsolve(op_uu, rhs)
+                # Solve biharmonic equation
+                lu = splu(block)
+                sol = lu.solve(rhs)
+                data_out[~mask, i] = sol[self.n_verts:]
 
             elif method == 'nearest':
                 # vertex by geodesic distance on the weighted mesh edge graph.
