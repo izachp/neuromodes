@@ -5,7 +5,7 @@ Module for reading, validating, manipulating, and creating meshes of brain struc
 from __future__ import annotations
 from typing import TYPE_CHECKING
 import numpy as np
-from scipy.sparse.linalg import spsolve
+from scipy.sparse.linalg import splu
 
 if TYPE_CHECKING:
     from typing import TypeVar
@@ -158,7 +158,7 @@ def smooth(
     data: NDArray[np.floating],
     mass: csc_matrix,
     stiffness: csc_matrix,
-    dt: float,  # TODO: convert to FWHM or similar
+    t: float,  # TODO: convert to, or add, rayleigh or FWHM
     checks: bool = True
 ) -> NDArray[np.floating]:
     """
@@ -172,7 +172,7 @@ def smooth(
         The mass matrix of the mesh.
     stiffness : scipy.sparse.csc_matrix
         The stiffness matrix of the mesh.
-    dt : float
+    t : float
         The time step for smoothing. Larger values will result in more smoothing.
 
     Returns
@@ -183,6 +183,7 @@ def smooth(
     from neuromodes.eigen import EigenData  # avoid circular import
 
     # Prelims
+    data = data.copy()
     if checks is not False:
         ved = EigenData(data=data, mass=mass, stiffness=stiffness, checks=checks)
         data, mass, stiffness = ved.data, ved.mass, ved.stiffness
@@ -191,9 +192,8 @@ def smooth(
         data = data[:, np.newaxis]
 
     # Smooth each map
-    for i in range(data.shape[1]):
-        # Solve (M + S) x = M @ data for x (the smoothed map)
-        A = mass + stiffness * dt
-        b = mass @ data[:, i]
-        data[:, i] = spsolve(A, b)
-    return data.squeeze(axis=1) if is_data_vec else data
+    # Solve (M + tS) x = M @ data for x (the smoothed map)
+    hmat = mass + stiffness * t
+    dataw = mass @ data
+    data_smooth = splu(hmat).solve(dataw)
+    return data_smooth.squeeze(axis=1) if is_data_vec else data_smooth

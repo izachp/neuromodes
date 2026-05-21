@@ -505,6 +505,24 @@ class EigenSolver(Solver):
             **kwargs
         )
 
+    def smooth(
+        self,
+        data: NDArray[np.floating],
+        t: float
+    ) -> NDArray[np.floating]:
+        """
+        This is a wrapper for :func:`~neuromodes.eigen.smooth`. Note that ``mass``, ``stiffness``,
+        and ``checks`` are passed automatically by the ``EigenSolver`` instance.
+        """
+        from neuromodes.mesh import smooth
+        return smooth(
+            data=data,
+            mass=self.mass,
+            stiffness=self.stiffness,  # TODO: decide how to document/support hetero/aniso smoothing
+            t=t,
+            checks='maps'
+        )
+
 def scale_hetero(
     hetero: NDArray[np.floating],
     alpha: float = 1.0,
