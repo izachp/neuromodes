@@ -761,3 +761,80 @@ class EigenData:
         if val is _MISSING:
             raise AttributeError(f"'{name}' was not provided to this EigenData instance.")
         return val
+
+def unparcellate(
+    data: NDArray[np.floating],
+    parcellation: NDArray[np.integer],
+    mass: csc_matrix | None = None,
+    interpolation: Literal['biharmonic'] | None = None,  # TODO: add harmonic, kriging, etc
+) -> NDArray[np.floating]:
+    """
+    Reconstructs a full array from parcellated data based on a parcellation map.
+
+    Parameters
+    ----------
+    data : np.ndarray
+        The parcellated data, where each element corresponds to a parcel. Can be 1D or 2D with shape
+        (n_parcels, n_maps).
+    parcellation : array-like
+        An array indicating the parcellation ID for each vertex. A value of 0 indicates that the 
+        vertex does not belong to any parcel.
+    interpolation : str or None, optional
+        The interpolation method to use for reconstructing the full array. Currently only
+        'biharmonic' is supported. If None, no interpolation is applied and each vertex is assigned
+        the value of its corresponding parcel. Default is None.
+
+    Returns
+    -------
+    np.ndarray
+        The reconstructed full array, where each vertex is assigned the value from the corresponding
+        parcel in `data`, or np.nan if it does not belong to any parcel.
+    """
+    # TODO: decide whether to move this to parcellation/mesh or some new interpolate/spatial
+    # TODO: use EigenData
+    # TODO: handle masking/0s/nans better
+    # TODO: consider adding mask param (if None, EigenSolver passes self.mask), forcing user to
+    # handle 0s in parc beforehand
+    # TODO: handle nD data
+    # TODO: consider supporting unparcellation of connectomes via P @ data @ P.T
+
+    from scipy.sparse import csc_matrix
+    # Format / validate arguments
+    if interpolation not in ['biharmonic', None]:
+        raise ValueError(f"Invalid interpolation method '{interpolation}'. Must be 'biharmonic' or None.")
+    data = np.asarray(data)
+    parcellation = np.asarray(parcellation, dtype=int, copy=True)
+    parc_ids = np.unique(parcellation)
+
+    # number of data observations must match number of parcels (account for medial wall being 0)
+    if data.ndim > 2:
+        raise ValueError("Data must be 1D or 2D.")
+    if parcellation.ndim != 1:
+        raise ValueError("Parcellation map must be 1D.")
+    if data.shape[0] != (n_parcels := len(parc_ids)):
+        if not (data.shape[0] == n_parcels - 1 and np.any(parc_ids == 0)):
+            raise ValueError(f"Data length ({data.shape[0]}) does not match the number of parcels ({n_parcels}). If 0 in parc indicates medial wall, ensure that data length matches the number of parcels excluding 0.")
+        warn('Number of observations in data matches number of parcels excluding 0. Proceeding with removal of 0 parcel.')
+        parcellation = parcellation[parcellation != 0]
+
+    n_verts = len(parcellation)
+    data_2d = data[:, np.newaxis] if (is_data_vec := data.ndim) == 1 else data
+
+    P = csc_matrix(
+        (np.ones(n_verts),
+         (np.arange(n_verts), parcellation)),
+        shape=(n_verts, n_parcels)
+        )
+
+    if interpolation == 'biharmonic':
+        vert_areas = np.asarray(np.sum(mass, axis=0))[0]  # FIXME: mask mass if necessary
+        parc_areas = P.T @ vert_areas
+
+        # use area-weighted parcellation matrix to preserve total area
+        P = P.multiply(vert_areas[:, np.newaxis] / parc_areas)
+        # Construct sparse parcellation matrix (n_verts, n_parcs)
+        raise NotImplementedError("Biharmonic interpolation is not yet implemented.")
+    
+    # Simple assignment
+    data_unparc = P @ data_2d
+    return data_unparc.squeeze(axis=1) if is_data_vec else data_unparc
