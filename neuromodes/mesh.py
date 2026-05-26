@@ -437,7 +437,6 @@ def make_vol_mesh(
     Tetrahedral meshing using Gmsh's python API and marching cubes algorithm.
     Returns a lapy.TetMesh object.
     """
-    import gmsh
     from skimage.measure import marching_cubes
     from scipy.ndimage import binary_closing
     from tetgen import TetGen
@@ -489,6 +488,7 @@ def make_vol_mesh(
                          "disconnected pieces.")
         
     if method == 'gmsh':
+        import gmsh
         gmsh.initialize()
         gmsh.model.add("vol")
 
