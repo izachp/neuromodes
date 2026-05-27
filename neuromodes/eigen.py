@@ -8,6 +8,7 @@ from warnings import warn
 from dataclasses import dataclass
 from lapy import Solver
 import numpy as np
+from scipy.sparse import csc_matrix
 from neuromodes.io import read_surf
 from neuromodes.mesh import mask_mesh, check_surf
 
@@ -18,7 +19,6 @@ if TYPE_CHECKING:
     from numpy import floating, integer, bool_
     from numpy.random import Generator
     from numpy.typing import NDArray
-    from scipy.sparse import csc_matrix
     from neuromodes.basis import _ReconSingle, _ReconList, _ReconTSSingle, _ReconTSList
 
 class EigenSolver(Solver):
@@ -766,6 +766,7 @@ def unparcellate(
     data: NDArray[np.floating],
     parcellation: NDArray[np.integer],
     mass: csc_matrix | None = None,
+    stiffness: csc_matrix | None = None,
     interpolation: Literal['biharmonic'] | None = None,  # TODO: add harmonic, kriging, etc
 ) -> NDArray[np.floating]:
     """
@@ -798,7 +799,9 @@ def unparcellate(
     # TODO: handle nD data
     # TODO: consider supporting unparcellation of connectomes via P @ data @ P.T
 
-    from scipy.sparse import csc_matrix
+    from scipy.sparse import csc_matrix, vstack, hstack
+    from scipy.sparse.linalg import splu
+
     # Format / validate arguments
     if interpolation not in ['biharmonic', None]:
         raise ValueError(f"Invalid interpolation method '{interpolation}'. Must be 'biharmonic' or None.")
@@ -807,6 +810,9 @@ def unparcellate(
     parc_ids = np.unique(parcellation)
 
     # number of data observations must match number of parcels (account for medial wall being 0)
+    if mass is None:
+        warn("No mass matrix provided. Assuming identity for interpolation, which may lead to suboptimal results.")
+        mass = csc_matrix((len(parcellation), len(parcellation)))  # dummy mass for interpolation
     if data.ndim > 2:
         raise ValueError("Data must be 1D or 2D.")
     if parcellation.ndim != 1:
@@ -815,26 +821,62 @@ def unparcellate(
         if not (data.shape[0] == n_parcels - 1 and np.any(parc_ids == 0)):
             raise ValueError(f"Data length ({data.shape[0]}) does not match the number of parcels ({n_parcels}). If 0 in parc indicates medial wall, ensure that data length matches the number of parcels excluding 0.")
         warn('Number of observations in data matches number of parcels excluding 0. Proceeding with removal of 0 parcel.')
-        parcellation = parcellation[parcellation != 0]
+        n_parcels -= 1
+        mask = parcellation != 0
+        parcellation = parcellation[mask]
+        parcellation -= 1  # re-index to account for removed 0 parcel
+        mass, stiffness = _mask_fem_matrices(mask, mass=mass, stiffness=stiffness)
 
     n_verts = len(parcellation)
-    data_2d = data[:, np.newaxis] if (is_data_vec := data.ndim) == 1 else data
+    is_data_vec = (data.ndim == 1)
+    data_2d = data[:, np.newaxis] if is_data_vec else data
 
-    P = csc_matrix(
+    parc_mat = csc_matrix(
         (np.ones(n_verts),
          (np.arange(n_verts), parcellation)),
         shape=(n_verts, n_parcels)
         )
 
     if interpolation == 'biharmonic':
-        vert_areas = np.asarray(np.sum(mass, axis=0))[0]  # FIXME: mask mass if necessary
-        parc_areas = P.T @ vert_areas
+        if stiffness is None:
+            raise ValueError("Stiffness matrix is required for biharmonic interpolation.")
+        n_maps = data_2d.shape[1]
+        data_unparc = np.empty((n_verts, n_maps))
+        vert_areas = np.asarray(np.sum(mass, axis=0))[0]
+        parc_areas = parc_mat.T @ vert_areas
 
         # use area-weighted parcellation matrix to preserve total area
-        P = P.multiply(vert_areas[:, np.newaxis] / parc_areas)
-        # Construct sparse parcellation matrix (n_verts, n_parcs)
-        raise NotImplementedError("Biharmonic interpolation is not yet implemented.")
-    
-    # Simple assignment
-    data_unparc = P @ data_2d
+        parc_mat = parc_mat.multiply(vert_areas[:, np.newaxis] / parc_areas)
+        
+        # set up block matrix KKT system
+        operator = vstack([
+            hstack([csc_matrix((n_verts, n_verts)), stiffness,                        parc_mat], format='csc'),
+            hstack([stiffness,                      -mass,                            csc_matrix((n_verts, n_parcels))], format='csc'),
+            hstack([parc_mat.T,                     csc_matrix((n_parcels, n_verts)), csc_matrix((n_parcels, n_parcels))], format='csc')
+        ], format='csc')
+
+        for i in range(n_maps):
+            rhs = np.concatenate([np.zeros(n_verts), np.zeros(n_verts), -data_2d[:, i]])
+            lu = splu(operator)
+            data_unparc[:, i] = -lu.solve(rhs)[:n_verts]
+
+    else:
+        # Simple assignment
+        data_unparc = parc_mat @ data_2d  # TODO: consider unmasking to nans before return
     return data_unparc.squeeze(axis=1) if is_data_vec else data_unparc
+
+def _mask_fem_matrices(
+    mask: NDArray[np.bool_],
+    mass: csc_matrix | None = None,
+    stiffness: csc_matrix | None = None
+) -> tuple[csc_matrix | None, csc_matrix | None]:
+    if mass is not None:
+        target_mass = np.asarray(mass[:, mask].sum(axis=0)).ravel()
+        mass = mass[mask, :][:, mask]
+        areas = np.asarray(mass.sum(axis=0)).ravel()
+        mass.setdiag(mass.diagonal() + (target_mass - areas))
+    if stiffness is not None:
+        stiffness = stiffness[mask, :][:, mask]
+        new_diag = stiffness.diagonal() - np.asarray(stiffness.sum(axis=0)).ravel()
+        stiffness.setdiag(new_diag)
+    return mass, stiffness
