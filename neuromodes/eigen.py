@@ -810,7 +810,7 @@ def unparcellate(
     parc_ids = np.unique(parcellation)
 
     # number of data observations must match number of parcels (account for medial wall being 0)
-    if mass is None:
+    if interpolation is not None and mass is None:
         warn("No mass matrix provided. Assuming identity for interpolation, which may lead to suboptimal results.")
         mass = csc_matrix((len(parcellation), len(parcellation)))  # dummy mass for interpolation
     if data.ndim > 2:
@@ -864,6 +864,43 @@ def unparcellate(
         # Simple assignment
         data_unparc = parc_mat @ data_2d  # TODO: consider unmasking to nans before return
     return data_unparc.squeeze(axis=1) if is_data_vec else data_unparc
+
+def parcellate(
+    data: NDArray[np.floating],
+    parcellation: NDArray[np.integer],
+    mass: csc_matrix | None = None,
+) -> NDArray[np.floating]:
+    from scipy.sparse import csc_matrix, eye
+
+    # Format / validate arguments
+    data = np.asarray(data)
+    parcellation = np.asarray(parcellation, dtype=int, copy=True)
+    parc_ids = np.unique(parcellation)
+    if data.ndim > 2:
+        raise ValueError("Data must be 1D or 2D.")
+    if parcellation.ndim != 1:
+        raise ValueError("Parcellation map must be 1D.")
+    if data.shape[0] != (n_verts := len(parcellation)):
+        raise ValueError(f"Data length ({data.shape[0]}) does not match the number of vertices ({n_verts}).")
+    if mass is None:
+        warn("No mass matrix provided. Assuming identity for parcellation, which may lead to suboptimal results.")
+        mass = eye(n_verts, format='csc')  # dummy mass for parcellation
+    n_parcels = len(parc_ids)
+    is_data_vec = (data.ndim == 1)
+    data_2d = data[:, np.newaxis] if is_data_vec else data
+
+    parc_mat = csc_matrix(  # TODO: construct the transpose needed, and consider csr/coo if faster
+        (np.ones(n_verts),
+         (np.arange(n_verts), parcellation)),
+        shape=(n_verts, n_parcels)
+        )
+
+    vert_areas = np.asarray(np.sum(mass, axis=0))[0]
+    parc_areas = parc_mat.T @ vert_areas
+    parc_mat = parc_mat.multiply(vert_areas[:, np.newaxis] / parc_areas)
+
+    data_parc = parc_mat.T @ data_2d
+    return data_parc.squeeze(axis=1) if is_data_vec else data_parc
 
 def _mask_fem_matrices(
     mask: NDArray[np.bool_],
