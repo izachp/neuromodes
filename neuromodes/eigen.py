@@ -661,6 +661,22 @@ def get_eigengroup_inds(
 
     return idx
 
+def _mask_fem_matrices(
+    mask: NDArray[np.bool_],
+    mass: csc_matrix | None = None,
+    stiffness: csc_matrix | None = None
+) -> tuple[csc_matrix | None, csc_matrix | None]:
+    if mass is not None:
+        target_mass = np.asarray(mass[:, mask].sum(axis=0)).ravel()
+        mass = mass[mask, :][:, mask]
+        areas = np.asarray(mass.sum(axis=0)).ravel()
+        mass.setdiag(mass.diagonal() + (target_mass - areas))
+    if stiffness is not None:
+        stiffness = stiffness[mask, :][:, mask]
+        new_diag = stiffness.diagonal() - np.asarray(stiffness.sum(axis=0)).ravel()
+        stiffness.setdiag(new_diag)
+    return mass, stiffness
+
 _MISSING = object()  
 @dataclass(frozen=True, init=False)
 class EigenData:

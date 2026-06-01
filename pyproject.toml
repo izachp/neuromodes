@@ -20,6 +20,7 @@ testing = [
 tutorials = [
     "ipykernel>=6.31.0",
     "matplotlib>=3.9.4",
+    "neuromaps @ git+https://github.com/netneurolab/neuromaps.git",
     "nsbutils[plotting]",
 ]
 cache = [
