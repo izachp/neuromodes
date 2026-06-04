@@ -3,7 +3,8 @@ Module for computing geometric eigenmodes of brain structures from surface and v
 """
 
 from __future__ import annotations
-from typing import Union, Tuple, TYPE_CHECKING
+from dataclasses import dataclass
+from typing import Union, Tuple, Any, TYPE_CHECKING
 from warnings import warn
 from lapy import Solver
 import numpy as np
@@ -693,7 +694,8 @@ def is_orthonormal_basis(
     emodes: ArrayLike,
     mass: Union[spmatrix, ArrayLike, None] = None,
     atol: float = 1e-03,
-    rtol: float = 1e-05
+    rtol: float = 1e-05,
+    checks=True
 ) -> bool:
     """
     Check if a set of vectors is orthonormal in Euclidean space (i.e., `emodes.T @ emodes == I`,
@@ -749,3 +751,162 @@ def is_orthonormal_basis(
     # Check Euclidean or mass-orthonormality
     prod = emodes.T @ emodes if mass is None else emodes.T @ mass @ emodes
     return np.allclose(prod, np.eye(n_modes), rtol=rtol, atol=atol, equal_nan=False)
+
+def get_eigengroup_inds(
+    n_modes: int,
+    ) -> list[NDArray[np.integer]]:
+    """
+    Identify eigengroups based on ordering of spherical harmonics. Each eigengroup 
+    contains the next 2k+1 modes, where k is the eigengroup number (starting from 0). If
+    n_modes does not include a complete eigengroup, the final group will contain the 
+    remaining modes.
+    
+    Parameters
+    ----------
+    n_modes : int
+        The number of eigenmodes, which determines the grouping.
+    
+    Returns
+    -------
+    list of list of int
+        A list where each element is a list of indices corresponding to the modes in that 
+        eigengroup.
+    """
+    i = np.arange(n_modes)
+    g = np.floor(np.sqrt(i)).astype(int)
+    idx = [i[g == k] for k in np.unique(g)]
+
+    return idx
+
+_MISSING = object()  
+@dataclass(frozen=True, init=False)
+class EigenData:
+    emodes: NDArray[floating]
+    evals: NDArray[floating] 
+    mass: csc_matrix
+    stiffness: csc_matrix
+    scaled_hetero: NDArray[floating]
+    data: NDArray[floating]
+
+    def __init__(
+        self,
+        emodes: NDArray[floating] | None = _MISSING, # type: ignore[assignment]
+        evals: NDArray[floating] | None = _MISSING, # type: ignore[assignment] 
+        mass: csc_matrix | None = _MISSING, # type: ignore[assignment]
+        stiffness: csc_matrix | None = _MISSING, # type: ignore[assignment]
+        scaled_hetero: NDArray[floating] | None = _MISSING, # type: ignore[assignment]
+        data: NDArray[floating] | None = _MISSING, # type: ignore[assignment]
+        checks: bool | str = True
+    ):  # TODO: add mask?
+
+        # Local helper to bypass 'frozen' restriction during initialization
+        def _set(name, val):
+            object.__setattr__(self, name, val)
+
+        check_shape = checks is True or checks == 'shape' or checks == 'maps' # need to get first dim when checking maps
+        check_maps = checks is True or checks == 'maps'
+        check_ortho = checks is True or checks == 'ortho'
+        check_evals = checks is True or checks == 'evals'
+
+        all_inputs = []
+
+        # Cast types and check shapes
+        if emodes is not _MISSING:
+            all_inputs.append('emodes')
+            if emodes is not None:
+                emodes = np.asarray_chkfinite(emodes)
+                if check_shape:
+                    if emodes.ndim != 2: 
+                        raise ValueError("emodes must be a 2D array.")
+                    if emodes.shape[0] <= emodes.shape[1]:
+                        raise ValueError("emodes must have shape (n_verts, n_modes), where n_verts "
+                                         "> n_modes.")
+            _set('emodes', emodes)
+
+        if evals is not _MISSING:
+            if evals is not None:
+                evals = np.asarray_chkfinite(evals)
+                if check_shape: 
+                    if emodes is not None and evals.shape != (emodes.shape[1],):
+                        raise ValueError(f"evals must have shape (n_modes,) = ({emodes.shape[1]},).")
+                if check_evals:
+                    if (evals[1:] <= 0).any():
+                        warn("Non-positive eigenvalues detected (beyond first eigenvalue). This "
+                             "may indicate an issue with the computation.")
+                    # Allow first eval to be slightly negative due to precision error
+                    if np.abs(evals[0]) > 1e-6:
+                        warn("The first eigenvalue is expected to be close to zero, received "
+                             f"{evals[0]}.")
+            _set('evals', evals)
+
+        # TODO : add lump input and parameter (confirm that mass is diagonal if lump=True)
+        if mass is not _MISSING:
+            all_inputs.append('mass')
+            if mass is not None and check_shape:
+                if mass.ndim != 2 or mass.shape[0] != mass.shape[1]: # type: ignore[union-attr]
+                    raise ValueError("mass must be a square matrix.")
+            _set('mass', mass)
+
+        if stiffness is not _MISSING:
+            all_inputs.append('stiffness')
+            if stiffness is not None and check_shape:
+                if stiffness.ndim != 2 or stiffness.shape[0] != stiffness.shape[1]: # type: ignore[union-attr]
+                    raise ValueError("stiffness must be a square matrix.")
+            _set('stiffness', stiffness)
+
+        if scaled_hetero is not _MISSING:
+            all_inputs.append('scaled_hetero')
+            if scaled_hetero is not None:
+                scaled_hetero = np.asarray_chkfinite(scaled_hetero)
+                if check_shape:
+                    if scaled_hetero.ndim != 1:
+                        raise ValueError("scaled_hetero must have shape (n_verts,).")
+            _set('scaled_hetero', scaled_hetero)
+
+        n_verts = None
+        # Check first dimension of each map at the same time (after self.name is set)
+        if check_shape:
+            for name in all_inputs:
+                val = getattr(self, name)
+                if val is None or val is _MISSING:
+                    continue
+                
+                first_dim = val.shape[0] # Sparse matrices and NDArrays both have .shape
+
+                if n_verts is None:
+                    # Establish the ground truth from the first available data source
+                    n_verts = first_dim
+                elif first_dim != n_verts:
+                    raise ValueError(
+                        f"Dimension mismatch in '{name}': "
+                        f"expected first dimension {n_verts}, but got {first_dim}."
+                    )
+            
+        if data is not _MISSING:
+            if check_maps and data is not None: # if check_maps is True, always check the shape
+                data = np.asarray(data)
+                if np.isnan(data).any(): 
+                    warn("NaN values detected in data, which may cause issues with computations.")
+                if np.isinf(data).any():
+                    warn("Inf values detected in data, which may cause issues with computations.")
+                if n_verts is not None and data.shape[0] != n_verts:
+                    raise ValueError(f"data must have first dimension {n_verts} to match the other "
+                                     "variables.")
+            _set('data', data)
+
+        # Check mass-orthonormality
+        if check_ortho and emodes is not _MISSING and emodes is not None:
+            m = mass if mass is not _MISSING else None
+            if not is_orthonormal_basis(emodes, m, checks=False):
+                err_str = "in Euclidean space" if m is None else "with the provided mass matrix"
+                raise ValueError(
+                    f"The columns of emodes do not form an orthonormal basis set {err_str}. Either "
+                    "provide a suitable mass matrix such that emodes.T @ mass @ emodes = I, use "
+                    "the 'regress' method for decomposition, or set checks=False."
+                )
+
+    def __getattribute__(self, name: str) -> Any:
+        val = super().__getattribute__(name)
+        if val is _MISSING:
+            raise AttributeError(f"'{name}' was not provided to this EigenData instance.")
+        return val
