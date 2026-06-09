@@ -13,10 +13,12 @@ from nibabel.gifti.gifti import GiftiImage
 from nibabel.loadsave import load
 import numpy as np
 from scipy.interpolate import griddata, RBFInterpolator
+from scipy.sparse.linalg import splu
 from neuromodes.io import fs_extensions
 
 if TYPE_CHECKING:
     from numpy.typing import ArrayLike, NDArray
+    from scipy.sparse import csc_matrix
 
 def is_vol(
     geometry: Union[TetMesh, TriaMesh, GiftiImage, str, Path, dict]
@@ -548,3 +550,47 @@ def make_vol_mesh(
     check_vol(mesh)
 
     return mesh
+
+def smooth(
+    data: NDArray[np.floating],
+    mass: csc_matrix,
+    stiffness: csc_matrix,
+    t: float,  # TODO: convert to, or add, rayleigh or FWHM
+    checks: bool = True
+) -> NDArray[np.floating]:
+    """
+    Smooth data on a surface mesh using the implicit Euler method.
+
+    Parameters
+    ----------
+    data : numpy.ndarray
+        The data to be smoothed, of shape ``(n_verts,)`` or ``(n_verts, n_maps)``. TODO: support nD
+    mass : scipy.sparse.csc_matrix
+        The mass matrix of the mesh.
+    stiffness : scipy.sparse.csc_matrix
+        The stiffness matrix of the mesh.
+    t : float
+        The time step for smoothing. Larger values will result in more smoothing.
+
+    Returns
+    -------
+    numpy.ndarray
+        The smoothed data, of the same shape as the input ``data``.
+    """
+    from neuromodes.eigen import EigenData  # avoid circular import
+
+    # Prelims
+    data = data.copy()
+    if checks is not False:
+        ved = EigenData(data=data, mass=mass, stiffness=stiffness, checks=checks)
+        data, mass, stiffness = ved.data, ved.mass, ved.stiffness
+
+    if (is_data_vec := (data.ndim == 1)):
+        data = data[:, np.newaxis]
+
+    # Smooth each map
+    # Solve (M + tS) x = M @ data for x (the smoothed map)
+    hmat = mass + stiffness * t
+    dataw = mass @ data
+    data_smooth = splu(hmat).solve(dataw)
+    return data_smooth.squeeze(axis=1) if is_data_vec else data_smooth
