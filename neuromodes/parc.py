@@ -2,6 +2,7 @@ from typing import TYPE_CHECKING
 from scipy.sparse.linalg import eigsh
 import numpy as np
 from neuromodes.eigen import EigenSolver, _mask_fem_matrices
+from lapy import Solver
 from neuromodes.mesh import mask_mesh
 
 if TYPE_CHECKING:
@@ -97,7 +98,7 @@ def make_parcellation(
         parc_grads.append(solver_b.emodes[:, -1])
         parc_ranks.append(solver_b.evals[-1])
 
-def make_pangcellation_mask_method(
+def make_pangcellation_maskfem(
     mass: csc_matrix,
     stiffness: csc_matrix,
     n_parcels: int,
@@ -154,6 +155,62 @@ def make_pangcellation_mask_method(
         parc_masks.append(mask_b)
         parc_grads.append(emodes_b[:, -1])
         parc_ranks.append(evals_b[-1])
+
+def make_pangcellation_maskfaces(
+    geometry: TriaMesh,
+    n_parcels: int,
+    seed: int | None = 0
+) -> NDArray[np.integer]:
+    # Format / validate arguments
+    if n_parcels < 2 or n_parcels > geometry.v.shape[0] or int(n_parcels) != n_parcels:
+        raise ValueError(f"n_parcels must be an integer in the range [2, {geometry.v.shape[0]}].")
+
+    evals, emodes = Solver(geometry).eigs(2, rng=seed)
+
+    # Initialise arrays
+    empty_mask = np.ones(geometry.t.shape[0], dtype=bool)
+    parc_masks = [np.ones_like(empty_mask)]
+    parc_grads = [emodes[geometry.t, -1].sum(axis=1)]
+    parc_ranks = [evals[-1]]
+    pangcellation = np.full(geometry.t.shape[0], fill_value=np.nan, dtype=int)
+
+    for i in range(1, n_parcels):
+        # find index of smallest eigenvalue across all submeshes
+        idx = np.argmin(parc_ranks)
+
+        # get mask of parent parcel, shape (geometry.t.shape[0],)
+        mask_parent = parc_masks[idx]
+
+        # create new face maska for daughter parcels, shapes (geometry.t.shape[0],)
+        split = parc_grads[idx] > 0
+        mask_daughter_a = empty_mask.copy()
+        mask_daughter_a[mask_parent] = split
+        mask_daughter_b = empty_mask.copy()
+        mask_daughter_b[mask_parent] = ~split
+
+        # update pangcellation with new parcel labels
+        pangcellation[mask_daughter_a] = i + 1
+
+        if i == n_parcels - 1:
+            return pangcellation
+
+        # create daughter submeshes
+        mesh_daughter_a = geometry.__class__(geometry.v, geometry.t[mask_daughter_a])
+        _ = mesh_daughter_a.rm_free_vertices_()
+        mesh_daughter_b = geometry.__class__(geometry.v, geometry.t[mask_daughter_b])
+        _ = mesh_daughter_b.rm_free_vertices_()
+
+        # Compute eigenmode and eigenvalue of each daughter submesh
+        evals_a, emodes_a = Solver(mesh_daughter_a).eigs(2, rng=seed)  # TODO: wrap in condition that n_verts > 2 to avoid error when submesh is too small to compute mode 2
+        evals_b, emodes_b = Solver(mesh_daughter_b).eigs(2, rng=seed)
+
+        # Replace parent data with one daughter, and add other daughter to list
+        parc_masks[idx] = mask_daughter_a
+        parc_grads[idx] = emodes_a[mesh_daughter_a.t, -1].sum(axis=1)  # TODO: store masks for memory efficiency (and to use full mesh indices?)
+        parc_ranks[idx] = evals_a[-1]
+        parc_masks.append(mask_daughter_b)
+        parc_grads.append(emodes_b[mesh_daughter_b.t, -1].sum(axis=1))
+        parc_ranks.append(evals_b[-1])    
 
 # TODO: try method where we compute modes on disconnected mesh by removing connections in
 # mass/stiffness
