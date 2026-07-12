@@ -541,3 +541,69 @@ def _rotate_coeffs_qr(
         tforms[group, :, :] = np.matmul(Q, inv_coeffs[group, :, :], axes=[(1, 2), (0, 2), (0, 2)])
 
     return tforms
+
+def flip_coeffs(
+    data: NDArray[np.floating],
+    emodes: NDArray[np.floating],
+    n_nulls: int = 1000,
+    mass: csc_matrix | None = None,
+    seed: int | None = None,
+    checks: _CheckKind = True
+) -> NDArray[np.floating]:
+    """
+    Generate spatial null maps via random flipping of eigenmode coefficients.
+
+    This function generates spatial null maps that preserve the spatial autocorrelation structure of
+    brain maps through random flipping of geometric eigenmode coefficients. The method works by
+    randomly flipping the sign of each coefficient, then reconstructing null maps using the original
+    decomposition coefficients.
+
+    Parameters
+    ----------
+    data : array-like
+        Empirical brain map(s) of shape ``(n_verts,)`` or ``(n_verts, n_maps)`` to generate nulls
+        from. If ``n_maps > 1``, the same set of randomized flips is applied to all maps for each
+        null.
+    emodes : array-like
+        The eigenmodes array of shape ``(n_verts, n_modes)``.
+    n_nulls : int, optional
+        Number of null maps to generate per input map. Default is 1000.
+    mass : array-like, optional
+        The mass matrix of shape ``(n_verts, n_verts)``. Default is ``None``.
+    seed : array-like or int, optional
+        Random seed for reproducibility. If an array of shape ``(n_nulls,)`` is provided, it is used
+        directly as the seed for each null. Otherwise, if a single integer is provided, it is used
+        to generate a master seed that is then used to generate a different seed for each null. If
+        ``None``, the global state is used. Default is ``None``.
+    checks : bool, optional
+        Whether to verify types, shapes, and orthonormality of ``emodes`` and ``mass`` before
+        decomposition. Default is ``True``.
+    
+    Returns
+    -------
+    np.ndarray
+        Generated null maps of shape ``(n_verts, n_nulls)`` if ``data`` has shape ``(n_verts,)``, or
+        ``(n_verts, n_nulls, n_maps)`` if ``data`` has shape ``(n_verts, n_maps)``.
+    """
+    # Format / validate arguments
+    if checks is not False:
+        ved = EigenData(emodes=emodes, mass=mass, data=data, checks=checks)
+        emodes, mass, data = ved.emodes, ved.mass, ved.data
+
+    if (is_vector_data := data.ndim == 1):
+        data = data[:, np.newaxis]
+
+    # Eigendecompose maps (coeffs is n_modes x n_maps)
+    coeffs = decompose(data, emodes, method='project', mass=mass, checks=False)
+
+    # Generate nulls using tforms of shape (n_modes, n_nulls, n_maps)
+    rng = np.random.default_rng(seed)
+    flips = rng.choice([-1, 1], size=(coeffs.shape[0], n_nulls, data.shape[1]))
+    tforms = coeffs[:, np.newaxis, :] * flips
+
+    nulls = np.tensordot(emodes, tforms, axes=(1, 0)) # (n_verts, n_nulls, n_maps)
+
+    if is_vector_data:
+        nulls = nulls.squeeze(axis=2)
+    
+    return nulls

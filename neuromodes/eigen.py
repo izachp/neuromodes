@@ -553,6 +553,25 @@ class EigenSolver(Solver):
             mask=self.mask,
             **kwargs
         )
+    
+    def flip_coeffs(
+        self,
+        data: NDArray[np.floating],
+        **kwargs
+    ) -> NDArray[np.floating]:
+        """
+        This is a wrapper for :func:`~neuromodes.nulls.flip_coeffs`. Note that ``emodes``,
+        ``mass``, and ``checks`` are passed automatically by the ``EigenSolver`` instance.
+        """
+        from neuromodes.nulls import flip_coeffs
+
+        return flip_coeffs(
+            data=data,
+            emodes=self.emodes,
+            mass=self.mass,
+            checks='maps',
+            **kwargs
+        )
 
 def align_basis(
     emodes: NDArray[np.floating],
