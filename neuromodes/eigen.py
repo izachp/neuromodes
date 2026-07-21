@@ -93,7 +93,7 @@ class EigenSolver(Solver):
 
         # Optionally mask
         if mask is not None:
-            geometry, mask = mask_mesh(geometry, mask, return_mask=True)
+            geometry = mask_mesh(geometry, mask)
 
         # Optionally normalize
         if normalize:
