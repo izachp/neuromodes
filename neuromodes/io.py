@@ -4,6 +4,7 @@ Module for loading surface meshes and maps, as well as setting up caching.
 
 from __future__ import annotations
 from importlib.resources import files, as_file
+from importlib.util import find_spec
 from os import getenv
 from pathlib import Path
 from typing import Tuple, cast, TYPE_CHECKING
@@ -224,12 +225,15 @@ def _cache_output(
     ImportError
         If ``joblib`` is not installed.
     """
-    try:
-        from joblib import Memory
-    except ImportError:
-        raise ImportError("joblib is required for caching. Neuromodes can be installed with the "
-                          "'cache' extra to include joblib as a dependency (e.g., pip install "
-                          "neuromodes[cache]).")
+    # Check for and import joblib
+    if find_spec("joblib") is None:
+        raise ImportError(
+            "joblib is required for caching. Neuromodes can be installed with the 'cache' extra to "
+            "include joblib as a dependency (e.g., pip install neuromodes[cache])."
+        )
+    from joblib import Memory
+
+    # Set up cache directory
     if cache_dir is None:
         cache_dir = getenv("CACHE_DIR")
         if cache_dir is None:
@@ -239,4 +243,5 @@ def _cache_output(
     cache_dir = Path(cache_dir)
     cache_dir.mkdir(parents=True, exist_ok=True)
 
+    # Return the cached function
     return Memory(cache_dir, verbose=0).cache(function)

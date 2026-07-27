@@ -4,6 +4,7 @@ surfaces.
 """
 
 from __future__ import annotations
+from importlib.util import find_spec
 from typing import Literal, TYPE_CHECKING, cast
 from warnings import warn
 import numpy as np
@@ -114,6 +115,8 @@ def sim_nft_waves(
         provided.
     ValueError
         If ``ext_input`` is provided and contains any NaN values.
+    ValueError
+        If ``n_jobs`` is not ``1`` and ``joblib`` is not installed.
 
     Notes
     -----
@@ -180,6 +183,13 @@ def sim_nft_waves(
                  "plausible wave speeds, or adjust speed_limits.")
     if method not in ['fourier', 'ode', 'fem']:
         raise ValueError(f"Invalid PDE method '{method}'; must be 'fourier', 'ode', or 'fem'.")
+    if n_jobs != 1:
+        if method != 'fem':
+            warn("n_jobs is ignored when method is not 'fem'.")
+        elif find_spec("joblib") is None:
+            raise ImportError("joblib must be installed to use n_jobs != 1 for parallel execution. "
+                              "Neuromodes can be installed with the 'cache' extra to include "
+                              "joblib as a dependency (e.g., pip install neuromodes[cache]). ")
 
     if ext_input is not None:
         if nt is not None:
@@ -204,7 +214,7 @@ def sim_nft_waves(
             noise_func = _gen_noise
         if method == 'fem':
             n_verts = stiffness.shape[0]
-            ext_input = np.asarray(noise_func(n_verts, nt, seed=seed))
+            ext_input = np.asarray(noise_func(n_verts, nt, seed=seed, sample='vertices', mass=mass))
         else:
             # Generate white noise in modal space: faster, memory efficient, and removes areal bias
             input_coeffs = np.asarray(noise_func(n_modes, nt, seed=seed))
@@ -339,19 +349,29 @@ def calc_wave_speed(
 def _gen_noise(
     n_samples: int,
     nt: int,
-    seed: int | None
+    sample: Literal['modes', 'vertices'] = 'modes',
+    mass: csc_matrix | None = None,
+    seed: int | None = None
 ) -> NDArray[np.floating]:
     """
-    Generate reproducible white noise of shape ``(n_samples, nt)`` for a given ``seed``, derived from
-    a standard normal distribution. The output is reproducible across nt (i.e.,
+    Generate reproducible white noise of shape ``(n_samples, nt)`` for a given ``seed``, derived
+    from a standard normal distribution. The output is reproducible across nt (i.e.,
     ``_gen_noise(n_samples, nt, seed) == _gen_noise(n_samples, nt+k, seed)[:, :nt]``).
 
     Parameters
     ----------
     n_samples : int
-        Number of samples (rows) in the output noise array.
+        Number of samples (rows) in the output noise array. Depending on ``sample``, each row
+        represents either an eigenmode or a vertex.
     nt : int
         Number of time points (columns) in the output noise array.
+    sample : {'modes', 'vertices'}, optional
+        Whether to generate noise in modal space (``'modes'``) or vertex space. Note that if
+        ``sample='vertices'``, the mass matrix must be provided to ensure that the expected
+        mass-weighted variance of the noise map is 1. Default is ``'modes'``.
+    mass : array-like, optional
+        The mass matrix of shape ``(n_verts, n_verts)`` used for normalization when
+        ``sample='vertices'``. Note that Default is ``None``.
     seed : int
         Random seed for reproducibility.
 
@@ -360,9 +380,46 @@ def _gen_noise(
     np.ndarray
         Gaussian white noise array of shape ``(n_samples, nt)``.
     """
+    if sample not in ['modes', 'vertices']:
+        raise ValueError(f"Invalid sample argument '{sample}'; must be 'modes' or 'vertices'.")
+    if sample == 'vertices' and mass is None:
+        raise ValueError("Mass matrix must be provided for normalization when sample='vertices'.")
+
+    # Draw samples from N(0, 1) in column-major order to ensure reproducibility across nt, then
+    # transpose to desired shape (n_samples, nt)
     rng = np.random.default_rng(seed)
-    # Generate in column-major order to ensure reproducibility across nt, then transpose
-    return rng.standard_normal((nt, n_samples)).T
+    noise = rng.standard_normal((nt, n_samples)).T
+
+    if sample == 'modes':
+        return noise
+    # In vertex space, we need to ensure that expected mass-weighted variance of the noise map is 1
+    elif mass.nnz == mass.shape[0]:
+        # Lumped mass is easily sqrt'd and inverted
+        return noise / np.sqrt(mass.diagonal())[:, None]
+    else:
+        # Consistent mass matrix requires solving a system
+        from scipy.sparse.csgraph import reverse_cuthill_mckee
+        from scipy.sparse.linalg import spsolve_triangular
+
+        # Permute rows/cols of mass matrix
+        perm = reverse_cuthill_mckee(mass, symmetric_mode=True)
+        inv_perm = np.argsort(perm)
+        mass_perm = mass[perm, :][:, perm]
+
+        # Factorize mass = L @ D @ L.T
+        lu = splu(mass_perm, permc_spec='NATURAL', diag_pivot_thresh=0,
+                  options={'SymmetricMode': True})
+        L_T = lu.L.tocsr().T
+
+        # Scale noise by D^(-1/2)
+        noise_rescaled = noise / np.sqrt(lu.U.diagonal())[:, None]
+
+        # Solve L.T @ x = noise*D(-1/2) for x
+        noise_rescaled = spsolve_triangular(L_T, noise_rescaled, lower=False, overwrite_a=True,
+                                            overwrite_b=True)
+
+        # Reverse the permutation
+        return noise_rescaled[inv_perm]
 
 def _model_wave_fourier(
     input_coeffs: NDArray[np.floating],
@@ -569,21 +626,17 @@ def _model_wave_fem(
     )
 
     # Define helper function for parallelization
+    # TODO: consider supporting Cholesky decomp if operator is SPD
     def _solve_fem_freq(operator, input):
         return splu(operator).solve(input)
 
     phi_freqs = None # stops it being unbound and keeps pyright happy
     if n_jobs > 1 or n_jobs == -1:
-        try:
-            from joblib import Parallel, delayed
-            phi_freqs = Parallel(n_jobs=n_jobs, verbose=verbose, prefer="threads")(
-                delayed(_solve_fem_freq)(op, inp) for op, inp in eqns
-            ) 
-        except ImportError:
-            warn("joblib is not installed; parallel computation of frequencies will be disabled. "
-                "Neuromodes can be installed with the 'cache' extra to include joblib as a "
-                "dependency (e.g., pip install neuromodes[cache]).")
-    if phi_freqs is None: # supposed to be serial, or if parallel failed
+        from joblib import Parallel, delayed
+        phi_freqs = Parallel(n_jobs=n_jobs, verbose=verbose, prefer="threads")(
+            delayed(_solve_fem_freq)(op, inp) for op, inp in eqns
+        )
+    else:
         phi_freqs = [_solve_fem_freq(op, inp) for op, inp in eqns]
     
     phi_freqs = np.stack(cast(list[NDArray[np.complex128]], phi_freqs), axis=1)
