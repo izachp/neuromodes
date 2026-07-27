@@ -6,7 +6,7 @@ import pytest
 from neuromodes.io import fetch_example_surf, fetch_example_map
 from neuromodes import EigenSolver
 from neuromodes.stats import zscorew, sigmoid_rescale
-from neuromodes.waves import sim_nft_waves, calc_wave_speed, _gen_noise, _analytical_fc
+from neuromodes.waves import sim_nft_waves, calc_wave_speed, _gen_noise, calc_nft_fc
 
 @pytest.fixture(scope="module")
 def solver():
@@ -126,6 +126,7 @@ def test_sim_nft_waves_reproducibility_fourier(solver):
 
     mse01 = np.mean((ts0 - ts1[:, :nt])**2)
     mse02 = np.mean((ts0 - ts2)**2)
+    print(f"MSE between same seed: {mse01:.4e}, MSE between different seeds: {mse02:.4e}")
     assert mse01 < 1e-5, \
         f"Simulated timeseries with the same seed do not match (MSE={mse01:.4e})."
     assert mse02 > 1e-3, \
@@ -203,7 +204,7 @@ def test_calc_wave_speed(solver):
 def test_analytical_fc(solver):
     sim_ts = solver.sim_nft_waves(nt=1000, dt=0.1, seed=0)
     # Check that simulated FC from waves aligns with the analytical FC
-    ana_fc = _analytical_fc(solver.emodes, solver.evals, r=17.4)
+    ana_fc = calc_nft_fc(solver.emodes, solver.evals, r=17.4)
     sim_fc = np.corrcoef(sim_ts)
     mse = np.mean((ana_fc - sim_fc)**2)
     assert mse < 0.01, f"Analytical FC does not align with simulated FC (MSE={mse:.4f})."
@@ -236,4 +237,29 @@ def test_fem_no_joblib(solver):
 
         assert fem_ts.shape == (solver.n_verts, nt), \
             "FEM output shape is incorrect when joblib is not installed."
-        
+
+def test_decomp_white_noise(solver):
+    # check that decomposition of white noise produces white noise in the modal space
+    # this validates our approach of generating white noise in modal space for ext_input=None
+    nt = 1000
+    ts_verts = _gen_noise(solver.n_verts, nt, seed=0)
+    ts_modes = solver.decompose(ts_verts)
+
+    # means of each mode's timeseries should be ~0 and vars should be similar across modes
+    means = np.mean(ts_modes, axis=1)
+    assert np.allclose(means, 0, atol=0.5), \
+        "Mean of decomposed white noise is not close to 0."
+    
+    vars = np.var(ts_modes, axis=1)
+    assert np.allclose(vars / np.mean(vars), 1, atol=0.5), \
+        "Variance of decomposed white noise is not similar across modes."
+
+# a bit slow
+# def test_sim_nft_waves_r0(solver):
+#     # Check that r=0 is permitted for each method
+#     r = 0
+#     nt = 5
+#     dt = 10
+#     _ = solver.sim_nft_waves(nt=nt, dt=dt, r=r, method='fem')
+#     _ = solver.sim_nft_waves(nt=nt, dt=dt, r=r, method='ode')
+#     _ = solver.sim_nft_waves(nt=nt, dt=dt, r=r, method='fourier')
