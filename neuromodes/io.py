@@ -243,5 +243,5 @@ def _cache_output(
     cache_dir = Path(cache_dir)
     cache_dir.mkdir(parents=True, exist_ok=True)
 
-    # Return the cached function
+    # Return cached version of the function
     return Memory(cache_dir, verbose=0).cache(function)

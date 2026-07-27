@@ -379,6 +379,7 @@ def _gen_noise(
     -------
     np.ndarray
         Gaussian white noise array of shape ``(n_samples, nt)``.
+        Gaussian white noise array of shape ``(n_samples, nt)``.
     """
     if sample not in ['modes', 'vertices']:
         raise ValueError(f"Invalid sample argument '{sample}'; must be 'modes' or 'vertices'.")
