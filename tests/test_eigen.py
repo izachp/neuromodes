@@ -1,10 +1,13 @@
 from pathlib import Path
-from lapy.shapedna import normalize_ev
+
 import numpy as np
 import pytest
-from neuromodes.eigen import EigenSolver, is_orthonormal_basis, get_eigengroup_inds
-from neuromodes.io import fetch_example_surf, fetch_example_map
-from neuromodes.stats import zscorew, sigmoid_rescale
+from lapy.shapedna import normalize_ev
+
+from neuromodes.eigen import EigenSolver, get_eigengroup_inds, is_orthonormal_basis
+from neuromodes.io import fetch_example_map, fetch_example_surf
+from neuromodes.stats import sigmoid_rescale, zscorew
+
 
 @pytest.fixture(scope="module")
 def surf_medmask():
