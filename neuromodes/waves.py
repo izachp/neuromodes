@@ -196,6 +196,21 @@ def sim_nft_waves(
                               "Neuromodes can be installed with the 'cache' extra to include "
                               "joblib as a dependency (e.g., pip install neuromodes[cache]). ")
 
+    if method != 'fem':
+        # Calculate undamped frequencies produced by each mode (Hz)
+        mode_freqs = gamma * np.sqrt(1 + r**2 * evals) / (2 * np.pi)
+        modes_is_nyquist = dt < 1 / (2 * mode_freqs)
+
+        # Check if highest-frequency mode is above Nyquist limit
+        if not modes_is_nyquist[-1]:
+            dt_max = 1 / (2 * mode_freqs[-1])
+            mode_idx = np.argmax(~modes_is_nyquist)
+            warn(f"dt={dt} is too large to capture frequencies produced by mode {mode_idx+1} "
+                 f"({mode_freqs[mode_idx]:.4f} Hz) and beyond, per the Nyquist limit. Consider "
+                 f"reducing dt to {dt_max} or lower. If simulated activity will be temporally "
+                 "smoothed and/or downsampled (e.g., by the Balloon-Windkessel model), this may "
+                 "not be a concern.")
+
     if ext_input is not None:
         if np.isnan(ext_input).any():
             raise ValueError("ext_input contains NaN values, which are not allowed.")
@@ -214,18 +229,18 @@ def sim_nft_waves(
     elif nt is not None:
         if cache_input and seed is not None:
             from neuromodes.io import _cache_output
-            noise_func = _cache_output(_gen_noise)
+            gen_noise = _cache_output(_gen_noise)
         else:
             if cache_input and seed is None:
                 warn("cache_input is ignored when seed is None.")
-            noise_func = _gen_noise
+            gen_noise = _gen_noise
         if method == 'fem':
             n_verts = stiffness.shape[0]
             # White noise in vertex space, pre-weighted by mass for weak form PDE
-            input_w = np.asarray(noise_func(n_verts, nt, seed=seed, sample='vertices', mass=mass))
+            input_w = np.asarray(gen_noise(n_verts, nt, seed=seed, sample='vertices', mass=mass))
         else:
             # Generate white noise in modal space for computational efficiency
-            input_coeffs = np.asarray(noise_func(n_modes, nt, seed=seed))
+            input_coeffs = np.asarray(gen_noise(n_modes, nt, seed=seed))
     else: # not the nicest, but it makes pyright the happiest
         raise ValueError("Either nt or ext_input must be provided.")
 

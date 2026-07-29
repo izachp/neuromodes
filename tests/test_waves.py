@@ -129,18 +129,17 @@ def test_gen_noise_covariance(solver):
     assert np.abs(var_mean - solver.n_modes) < 1  # expected variance is n_modes
 
     # Lumped mass-normalised white noise
-    mass_lumped = solver.compute_lbo(lump=True).mass
+    mass_lumped = EigenSolver(solver.geometry).compute_lbo(lump=True).mass
     # remove mass-weighting by taking inverse mass as reciprocal of diagonal
     mass_inv = 1/mass_lumped.diagonal()[:, None]
     noise = mass_inv * _gen_noise(solver.n_verts, nt, mass=mass_lumped, seed=seed)  
-    cov_mat = noise.T @ solver.mass @ noise
+    cov_mat = noise.T @ mass_lumped @ noise
     cov_mean = cov_mat[np.triu_indices_from(cov_mat, k=1)].mean()
     var_mean = np.diag(cov_mat).mean()
     assert np.abs(cov_mean) < 0.35                # expected covariance is 0
     assert np.abs(var_mean - solver.n_verts) < 2  # expected variance is n_verts
 
     # TODO: Consistent mass-normalised white noise
-    solver.compute_lbo()
     noise = _gen_noise(solver.n_verts, nt, mass=solver.mass, seed=seed)
     # remove mass-weighting by solving mass * x = noise
     noise = splu(solver.mass).solve(noise)
@@ -192,7 +191,8 @@ def test_sim_nft_waves_ode_balloon_overflow(solver):
     dt = 1
 
     with pytest.raises(RuntimeError, match="message: Required step size is less than spacing"):
-        activity = solver.sim_nft_waves(dt=dt, nt=10, method='ode')
+        with pytest.warns(UserWarning, match="dt=1 is too large"):
+            activity = solver.sim_nft_waves(dt=dt, nt=10, method='ode')
         solver.balloon_model(activity, method='ode', dt=dt)
 
 def test_sim_nft_waves_cached(solver):
@@ -242,7 +242,8 @@ def test_calc_wave_speed(solver):
     assert speed.shape == (solver.n_verts,), "Output shape is incorrect when using hetero." # type: ignore
 
 def test_analytical_fc(solver):
-    sim_ts = solver.sim_nft_waves(nt=1000, dt=0.1, seed=0)
+    with pytest.warns(UserWarning, match="dt=1 is too large"):
+        sim_ts = solver.sim_nft_waves(nt=1000, dt=0.1, seed=0)
     # Check that simulated FC from waves aligns with the analytical FC
     ana_fc = calc_nft_fc(solver.emodes, solver.evals, r=17.4)
     sim_fc = np.corrcoef(sim_ts)
