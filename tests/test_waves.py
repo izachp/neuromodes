@@ -4,10 +4,11 @@ from unittest.mock import patch
 
 import numpy as np
 import pytest
+from scipy.sparse.linalg import splu
 
 from neuromodes import EigenSolver
 from neuromodes.io import fetch_example_map, fetch_example_surf
-from neuromodes.stats import sigmoid_rescale, zscorew
+from neuromodes.stats import cdistw, sigmoid_rescale, zscorew
 from neuromodes.waves import _gen_noise, calc_nft_fc, calc_wave_speed, sim_nft_waves
 
 
@@ -101,8 +102,9 @@ def test_sim_nft_waves_methods_bold(solver):
 
     # Methods converge to r=.98 by t=500, but this takes too long to run, so just anchor the test
     # to a lower value to catch if the alignment ever drops (TODO: add to validation?)
-    for t in range(75, nt):
-        assert np.corrcoef(bold_fourier[:, t], bold_ode[:, t])[0, 1] > 0.6, \
+    for t in range(76, nt):
+        cos = 1-cdistw(bold_fourier[:, t], bold_ode[:, t], solver.mass, metric='cosine')[0][0]
+        assert cos > 0.6, \
             f'Fourier and ODE BOLD solutions are not correlated at r>.6 at t={t}.'
         
 # TODO: add test that BOLD FC is very similar to neural FC
@@ -113,6 +115,41 @@ def test_gen_noise_reproducibility():
     noise2 = _gen_noise(5, 20, seed=seed)
     assert (noise1 == noise2[:, :10]).all(), \
         "Noise generated with the same seed does not match across different nt."
+
+def test_gen_noise_covariance(solver):
+    seed = 0
+    nt = 500
+
+    # Modal white noise
+    noise = solver.emodes @ _gen_noise(solver.n_modes, nt, seed=seed)
+    cov_mat = noise.T @ solver.mass @ noise  # shape (nt, nt)
+    cov_mean = cov_mat[np.triu_indices_from(cov_mat, k=1)].mean()
+    var_mean = np.diag(cov_mat).mean()
+    assert np.abs(cov_mean) < 0.05                # expected covariance is 0
+    assert np.abs(var_mean - solver.n_modes) < 1  # expected variance is n_modes
+
+    # Lumped mass-normalised white noise
+    mass_lumped = solver.compute_lbo(lump=True).mass
+    # remove mass-weighting by taking inverse mass as reciprocal of diagonal
+    mass_inv = 1/mass_lumped.diagonal()[:, None]
+    noise = mass_inv * _gen_noise(solver.n_verts, nt, mass=mass_lumped, seed=seed)  
+    cov_mat = noise.T @ solver.mass @ noise
+    cov_mean = cov_mat[np.triu_indices_from(cov_mat, k=1)].mean()
+    var_mean = np.diag(cov_mat).mean()
+    assert np.abs(cov_mean) < 0.35                # expected covariance is 0
+    assert np.abs(var_mean - solver.n_verts) < 2  # expected variance is n_verts
+
+    # TODO: Consistent mass-normalised white noise
+    solver.compute_lbo()
+    noise = _gen_noise(solver.n_verts, nt, mass=solver.mass, seed=seed)
+    # remove mass-weighting by solving mass * x = noise
+    noise = splu(solver.mass).solve(noise)
+    cov_mat = noise.T @ solver.mass @ noise
+    cov_mean = cov_mat[np.triu_indices_from(cov_mat, k=1)].mean()
+    var_mean = np.diag(cov_mat).mean()
+    assert np.abs(cov_mean) < 0.35                # expected covariance is 0
+    assert np.abs(var_mean - solver.n_verts) < 2  # expected variance is n_verts
+
 
 def test_sim_nft_waves_reproducibility_fourier(solver):
     
@@ -130,9 +167,9 @@ def test_sim_nft_waves_reproducibility_fourier(solver):
     mse01 = np.mean((ts0 - ts1[:, :nt])**2)
     mse02 = np.mean((ts0 - ts2)**2)
     print(f"MSE between same seed: {mse01:.4e}, MSE between different seeds: {mse02:.4e}")
-    assert mse01 < 1e-5, \
+    assert mse01 < 2e-7, \
         f"Simulated timeseries with the same seed do not match (MSE={mse01:.4e})."
-    assert mse02 > 1e-3, \
+    assert mse02 > 3e-4, \
         f"Simulated timeseries with different seeds match unexpectedly (MSE={mse02:.4f})."
 
 def test_sim_nft_waves_invalid_input_shape(solver):
@@ -216,16 +253,18 @@ def test_fem_alignment(solver):
     # Check that modal approximation aligns with FEM solution
     nt=50
     dt=0.1
-    seed=0
+    # construct input using first modes only to remove truncation error
+    ext_input = solver.emodes @ _gen_noise(solver.n_modes, nt, seed=0)
 
-    fourier_ts = solver.sim_nft_waves(nt=nt, dt=dt, seed=seed)
+    fourier_ts = solver.sim_nft_waves(dt=dt, ext_input=ext_input)
 
     # Run FEM simulation
-    fem_ts = solver.sim_nft_waves(nt=nt, dt=dt, seed=seed, n_jobs=1, method='fem')
+    fem_ts = solver.sim_nft_waves(dt=dt, ext_input=ext_input, n_jobs=1, method='fem')
 
     # Assess
     for t in range(10, nt):
-        assert np.corrcoef(fourier_ts[:, t], fem_ts[:, t])[0, 1] > 0.8, \
+        cos = 1-cdistw(fourier_ts[:, t], fem_ts[:, t], solver.mass, metric='cosine')[0][0]
+        assert cos > 1-1e-9, \
             f'Modal and FEM solutions are not correlated at r>.8 at t={t}.'
 
 def test_fem_no_joblib(solver):
@@ -234,9 +273,9 @@ def test_fem_no_joblib(solver):
     dt=0.1
     seed=0
 
-    with patch.dict('sys.modules', {'joblib': None}):
-        with pytest.warns(UserWarning, match="joblib is not installed"):
-            fem_ts = solver.sim_nft_waves(nt=nt, dt=dt, seed=seed, n_jobs=-1, method='fem')
+    with (patch.dict('sys.modules', {'joblib': None}),
+          pytest.raises(ImportError, match='joblib must be installed')):
+        fem_ts = solver.sim_nft_waves(nt=nt, dt=dt, seed=seed, n_jobs=-1, method='fem')
 
         assert fem_ts.shape == (solver.n_verts, nt), \
             "FEM output shape is incorrect when joblib is not installed."

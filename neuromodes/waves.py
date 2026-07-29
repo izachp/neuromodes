@@ -197,17 +197,19 @@ def sim_nft_waves(
                               "joblib as a dependency (e.g., pip install neuromodes[cache]). ")
 
     if ext_input is not None:
+        if np.isnan(ext_input).any():
+            raise ValueError("ext_input contains NaN values, which are not allowed.")
         if nt is not None:
             warn("nt is ignored when ext_input is provided.")
         if seed is not None:
             warn("seed is ignored when ext_input is provided.")
         if cache_input:
             warn("cache_input is ignored when ext_input is provided.")
-        if np.isnan(ext_input).any():
-            raise ValueError("ext_input contains NaN values, which are not allowed.")
         nt = ext_input.shape[1]
-        # Decompose input to modal space
-        if method != 'fem':
+        # Process external input
+        if method == 'fem':
+            input_w = mass @ ext_input
+        else:
             input_coeffs = decompose(ext_input, emodes, mass=mass, checks=False)
     elif nt is not None:
         if cache_input and seed is not None:
@@ -219,9 +221,10 @@ def sim_nft_waves(
             noise_func = _gen_noise
         if method == 'fem':
             n_verts = stiffness.shape[0]
-            ext_input = np.asarray(noise_func(n_verts, nt, seed=seed, sample='vertices', mass=mass))
+            # White noise in vertex space, pre-weighted by mass for weak form PDE
+            input_w = np.asarray(noise_func(n_verts, nt, seed=seed, sample='vertices', mass=mass))
         else:
-            # Generate white noise in modal space: faster, memory efficient, and removes areal bias
+            # Generate white noise in modal space for computational efficiency
             input_coeffs = np.asarray(noise_func(n_modes, nt, seed=seed))
     else: # not the nicest, but it makes pyright the happiest
         raise ValueError("Either nt or ext_input must be provided.")
@@ -230,7 +233,7 @@ def sim_nft_waves(
     if method == 'fem':
         if mass is None or stiffness is None:
             raise ValueError("Mass and stiffness matrices must be provided for FEM method.")
-        return _model_wave_fem(ext_input, dt=dt, r=r, gamma=gamma, mass=mass, stiffness=stiffness,
+        return _model_wave_fem(input_w, dt=dt, r=r, gamma=gamma, mass=mass, stiffness=stiffness,
                                n_jobs=n_jobs, verbose=verbose)
     
     # Standard modal implementation: decompose input and reconstruct output
@@ -309,6 +312,8 @@ def balloon_model(
             raise ValueError(f"Parameter '{param_name}' must be a positive number.")
 
     # Eigendecompose activity to get modal coefficients over time
+    # TODO: consider re-adding sim_nft_waves(..., return_bold=False) to avoid redundant
+    # decomposition/padding/fft/ifft/slicing/reconstruction
     activity_coeffs = decompose(activity, emodes, mass=mass, checks=False)
 
     # Apply model to each mode's activity timeseries
@@ -354,7 +359,6 @@ def calc_wave_speed(
 def _gen_noise(
     n_samples: int,
     nt: int,
-    sample: Literal['modes', 'vertices'] = 'modes',
     mass: csc_matrix | None = None,
     seed: int | None = None
 ) -> NDArray[np.floating]:
@@ -370,13 +374,10 @@ def _gen_noise(
         represents either an eigenmode or a vertex.
     nt : int
         Number of time points (columns) in the output noise array.
-    sample : {'modes', 'vertices'}, optional
-        Whether to generate noise in modal space (``'modes'``) or vertex space. Note that if
-        ``sample='vertices'``, the mass matrix must be provided to ensure that the expected
-        mass-weighted variance of the noise map is 1. Default is ``'modes'``.
     mass : array-like, optional
-        The mass matrix of shape ``(n_verts, n_verts)`` used for normalization when
-        ``sample='vertices'``. Note that Default is ``None``.
+        The mass matrix of shape ``(n_verts, n_verts)`` used for combined normalization /
+        mass-weighting (for weak form PDE). If ``None``, no corrections are applied (e.g., modal
+        noise). Default is ``None``.
     seed : int
         Random seed for reproducibility.
 
@@ -384,48 +385,47 @@ def _gen_noise(
     -------
     np.ndarray
         Gaussian white noise array of shape ``(n_samples, nt)``.
-        Gaussian white noise array of shape ``(n_samples, nt)``.
     """
-    if sample not in ['modes', 'vertices']:
-        raise ValueError(f"Invalid sample argument '{sample}'; must be 'modes' or 'vertices'.")
-    if sample == 'vertices' and mass is None:
-        raise ValueError("Mass matrix must be provided for normalization when sample='vertices'.")
 
     # Draw samples from N(0, 1) in column-major order to ensure reproducibility across nt, then
     # transpose to desired shape (n_samples, nt)
     rng = np.random.default_rng(seed)
     noise = rng.standard_normal((nt, n_samples)).T
 
-    if sample == 'modes':
+    if mass is None:  # modes along rows
         return noise
-    # In vertex space, we need to ensure that expected mass-weighted variance of the noise map is 1
-    elif mass.nnz == mass.shape[0]:
-        # Lumped mass is easily sqrt'd and inverted
-        return noise / np.sqrt(mass.diagonal())[:, None]
-    else:
-        # Consistent mass matrix requires solving a system
-        from scipy.sparse.csgraph import reverse_cuthill_mckee
-        from scipy.sparse.linalg import spsolve_triangular
+    
+    # For vertex space, we first mass-normalise the noise map to ensure that its mass-weighted
+    # variance has an expected value of 1.
+    # This is achieved by f = mass^(-1/2) @ noise: f.T @ mass @ f = noise.T @ noise = 1
+    # After incorporating the mass-weighting needed later for the weak form PDE, this becomes:
+    # mass @ f = mass @ mass^(-1/2) @ noise = mass^(1/2) @ noise.
+    if mass.nnz == mass.shape[0]:
+        # Lumped mass is diagonal and thus easily sqrt'd
+        return noise * np.sqrt(mass.diagonal())[:, None]
 
-        # Permute rows/cols of mass matrix
-        perm = reverse_cuthill_mckee(mass, symmetric_mode=True)
-        inv_perm = np.argsort(perm)
-        mass_perm = mass[perm, :][:, perm]
+    # Consistent mass requires matrix factorisation
+    from scipy.sparse.csgraph import reverse_cuthill_mckee
 
-        # Factorize mass = L @ D @ L.T
-        lu = splu(mass_perm, permc_spec='NATURAL', diag_pivot_thresh=0,
-                  options={'SymmetricMode': True})
-        L_T = lu.L.tocsr().T
+    # Manually permute rows/cols of mass for reduced bandwidth and thus increased sparsity of L
+    # and U factors for efficiency. splu usually does this internally, but does not offer the
+    # option to ensure symmetric permutation, as is needed for L @ U = L @ D @ L.T (see below).
+    perm = reverse_cuthill_mckee(mass, symmetric_mode=True)
+    inv_perm = np.argsort(perm)
+    mass_perm = mass[perm, :][:, perm]
 
-        # Scale noise by D^(-1/2)
-        noise_rescaled = noise / np.sqrt(lu.U.diagonal())[:, None]
+    # Factorize mass = L @ U = L @ D @ L.T = (L @ D^(1/2)) @ (L @ D^(1/2)).T = mass^(1/2) @ mass^(1/2).T
+    # i.e., use splu but since mass is SPD we can get the Cholesky factorization without needing
+    # extra dependencies
+    lu = splu(mass_perm, permc_spec='NATURAL', diag_pivot_thresh=0)
+    L = lu.L.tocsr()
+    D = lu.U.diagonal()[:, None]
 
-        # Solve L.T @ x = noise*D(-1/2) for x
-        noise_rescaled = spsolve_triangular(L_T, noise_rescaled, lower=False, overwrite_a=True,
-                                            overwrite_b=True)
+    # Scale noise by mass^(1/2) = L @ D^(1/2)
+    noise_normed = L @ (np.sqrt(D) * noise)
 
-        # Reverse the permutation
-        return noise_rescaled[inv_perm]
+    # Reverse the permutation
+    return noise_normed[inv_perm]
 
 def _model_wave_fourier(
     input_coeffs: NDArray[np.floating],
@@ -490,7 +490,7 @@ def _model_wave_fourier(
     omega = -2 * np.pi * np.fft.rfftfreq(2*nt, d=dt) # keep consistent with _model_balloon_fourier
 
     # Compute transfer function and apply it to frequency-domain input
-    H = gamma**2 / ((-omega**2 - 2j * omega * gamma) + gamma**2 * (1 + r**2 * evals[:, None]))
+    H = gamma**2 / (-omega**2 - 2j * omega * gamma + gamma**2 * (1 + r**2 * evals[:, None]))
     out_fft = H * input_coeffs_f
 
     # Inverse transform to time domain (irfft is fast)
@@ -572,7 +572,7 @@ def _model_wave_ode(
     return mode_coeffs
 
 def _model_wave_fem(
-    ext_input: NDArray[np.floating],
+    input_w: NDArray[np.floating],
     mass: csc_matrix,
     stiffness: csc_matrix,
     dt: float = 1e-4,
@@ -589,8 +589,9 @@ def _model_wave_fem(
 
     Parameters
     ----------
-    ext_input : np.ndarray
-        Array of external input at each vertex over time, with shape ``(n_verts, nt)``.
+    input_w : np.ndarray
+        Array of mass-weighted external input at each vertex over time, with shape ``(n_verts,
+        nt)``.
     mass : scipy.sparse.csc_matrix
         The mass matrix of shape ``(n_verts, n_verts)``.
     stiffness : scipy.sparse.csc_matrix
@@ -607,10 +608,7 @@ def _model_wave_fem(
     verbose : int, optional
         Verbosity level for parallel execution. Default is ``0``.
     """
-    nt = ext_input.shape[1]
-
-    # Mass-weight input so that sparser (larger) vertices are compensated by larger amplitude
-    input_w = mass @ ext_input
+    nt = input_w.shape[1]
 
     # Pad input with zeros on negative side to ensure causality (system is only driven for t >= 0)
     # This is required for the correct Green's function solution of the damped wave equation.
@@ -632,9 +630,8 @@ def _model_wave_fem(
     )
 
     # Define helper function for parallelization
-    # TODO: consider supporting Cholesky decomp if operator is SPD
     def _solve_fem_freq(operator, input):
-        return splu(operator).solve(input)
+        return splu(operator).solve(input)  # cannot use Cholesky as operator is not always SPD
 
     phi_freqs = None # stops it being unbound and keeps pyright happy
     if n_jobs > 1 or n_jobs == -1:
