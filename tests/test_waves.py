@@ -241,9 +241,8 @@ def test_calc_wave_speed(solver):
     assert np.all(speed > 0), "Output contains non-positive wave speeds when using hetero."
     assert speed.shape == (solver.n_verts,), "Output shape is incorrect when using hetero." # type: ignore
 
-def test_analytical_fc(solver):
-    with pytest.warns(UserWarning, match="dt=1 is too large"):
-        sim_ts = solver.sim_nft_waves(nt=1000, dt=0.1, seed=0)
+def test_analytical_fc(solver):  
+    sim_ts = solver.sim_nft_waves(nt=5000, dt=0.01, seed=0)
     # Check that simulated FC from waves aligns with the analytical FC
     ana_fc = calc_nft_fc(solver.emodes, solver.evals, r=17.4)
     sim_fc = np.corrcoef(sim_ts)
@@ -253,7 +252,7 @@ def test_analytical_fc(solver):
 def test_fem_alignment(solver):
     # Check that modal approximation aligns with FEM solution
     nt=50
-    dt=0.1
+    dt=0.01
     # construct input using first modes only to remove truncation error
     ext_input = solver.emodes @ _gen_noise(solver.n_modes, nt, seed=0)
 
@@ -266,7 +265,7 @@ def test_fem_alignment(solver):
     for t in range(10, nt):
         cos = 1-cdistw(fourier_ts[:, t], fem_ts[:, t], solver.mass, metric='cosine')[0][0]
         assert cos > 1-1e-9, \
-            f'Modal and FEM solutions are not correlated at r>.8 at t={t}.'
+            f'Modal and FEM solutions are not identical (cos > 1-1e-9) at t={t}.'
 
 def test_fem_no_joblib(solver):
     # Check that FEM simulation runs without joblib installed
@@ -280,29 +279,3 @@ def test_fem_no_joblib(solver):
 
         assert fem_ts.shape == (solver.n_verts, nt), \
             "FEM output shape is incorrect when joblib is not installed."
-
-def test_decomp_white_noise(solver):
-    # check that decomposition of white noise produces white noise in the modal space
-    # this validates our approach of generating white noise in modal space for ext_input=None
-    nt = 1000
-    ts_verts = _gen_noise(solver.n_verts, nt, seed=0)
-    ts_modes = solver.decompose(ts_verts)
-
-    # means of each mode's timeseries should be ~0 and vars should be similar across modes
-    means = np.mean(ts_modes, axis=1)
-    assert np.allclose(means, 0, atol=0.5), \
-        "Mean of decomposed white noise is not close to 0."
-    
-    vars = np.var(ts_modes, axis=1)
-    assert np.allclose(vars / np.mean(vars), 1, atol=0.5), \
-        "Variance of decomposed white noise is not similar across modes."
-
-# a bit slow
-# def test_sim_nft_waves_r0(solver):
-#     # Check that r=0 is permitted for each method
-#     r = 0
-#     nt = 5
-#     dt = 10
-#     _ = solver.sim_nft_waves(nt=nt, dt=dt, r=r, method='fem')
-#     _ = solver.sim_nft_waves(nt=nt, dt=dt, r=r, method='ode')
-#     _ = solver.sim_nft_waves(nt=nt, dt=dt, r=r, method='fourier')

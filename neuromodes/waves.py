@@ -38,6 +38,7 @@ def sim_nft_waves(
     stiffness: csc_matrix | None = None, # only used for FEM
     speed_limits: tuple[float, float] | None = (0, 150),
     hetero: NDArray[np.floating] | None = None,
+    padding_tol: np.floating = 1e-5,
     checks: _CheckKind = True,
     seed: int | None = None,
     cache_input: bool = False,
@@ -80,6 +81,12 @@ def sim_nft_waves(
         Heterogeneity map of shape ``(n_verts,)``, to be provided when ``emodes`` are heterogeneous.
         This is used only to check wave speeds (see ``speed_limits`` above). If not provided, wave
         speed is assumed to be spatially uniform. Default is ``None``.
+    padding_tol : float, optional
+        Tolerance for Fourier wrap-around artifacts when ``method`` is ``'fourier'`` or ``'fem'``,
+        between ``0`` and ``1``. Lower values increase the amount of zero-padding and thus the
+        simulation time and memory usage. The number of padding timepoints is given by
+        -ln(``padding_tol``)/(``gamma``*``dt``), meaning that a value of ``1`` at t=0 wraps around
+        to a value of ``padding_tol`` at t=nt-1. Default is ``1e-5``.
     checks : bool, optional
         Whether to validate the input arguments. Default is ``True``.
     seed : int, optional
@@ -122,6 +129,8 @@ def sim_nft_waves(
         If ``ext_input`` is provided and contains any NaN values.
     ValueError
         If ``n_jobs`` is not ``1`` and ``joblib`` is not installed.
+    ValueError
+        If ``padding_tol`` is not between ``0`` and ``1``.
 
     Notes
     -----
@@ -188,6 +197,8 @@ def sim_nft_waves(
                  "plausible wave speeds, or adjust speed_limits.")
     if method not in ['fourier', 'ode', 'fem']:
         raise ValueError(f"Invalid PDE method '{method}'; must be 'fourier', 'ode', or 'fem'.")
+    if padding_tol <= 0 or padding_tol > 1:
+        raise ValueError("padding_tol must be between 0 and 1.")
     if n_jobs != 1:
         if method != 'fem':
             warn("n_jobs is ignored when method is not 'fem'.")
@@ -249,11 +260,12 @@ def sim_nft_waves(
         if mass is None or stiffness is None:
             raise ValueError("Mass and stiffness matrices must be provided for FEM method.")
         return _model_wave_fem(input_w, dt=dt, r=r, gamma=gamma, mass=mass, stiffness=stiffness,
-                               n_jobs=n_jobs, verbose=verbose)
+                               padding_tol=padding_tol, n_jobs=n_jobs, verbose=verbose)
     
     # Standard modal implementation: decompose input and reconstruct output
-    _model_wave = _model_wave_fourier if method == 'fourier' else _model_wave_ode
-    activity_coeffs = _model_wave(input_coeffs, dt, r, gamma, evals)
+    activity_coeffs = (_model_wave_fourier(input_coeffs, dt, r, gamma, evals, padding_tol)
+                       if method == 'fourier' else
+                       _model_wave_ode(input_coeffs, dt, r, gamma, evals))
 
     return emodes @ activity_coeffs
 
@@ -263,6 +275,7 @@ def balloon_model(
     emodes: NDArray[np.floating],
     method: _PDEKind = "fourier",
     mass: csc_matrix | None = None,
+    padding_tol: np.floating = 1e-5,
     checks: _CheckKind = True,
     **params
 ) -> NDArray[np.floating]:
@@ -285,6 +298,12 @@ def balloon_model(
     mass : array-like, optional
         The mass matrix of shape (n_verts, n_verts) used for the decomposition when method is
         ``'project'``. Default is ``None``.
+    padding_tol : float, optional
+        Tolerance for Fourier wrap-around artifacts, between ``0`` and ``1``. Lower values increase
+        the amount of zero-padding and thus the simulation time and memory usage. The number of
+        padding timepoints is given by -ln(``padding_tol``)/(``dt`` * min(``kappa``/2, 1/``tau``,
+        1/(``tau`` * ``alpha``))), meaning that a value of ``1`` at t=0 wraps around to a value of
+        approximately ``padding_tol`` at t=``nt``-1. Default is ``1e-5``.
     checks : bool, optional
         Whether to perform checks on the input arrays. Default is ``True``.
     **params
@@ -332,8 +351,9 @@ def balloon_model(
     activity_coeffs = decompose(activity, emodes, mass=mass, checks=False)
 
     # Apply model to each mode's activity timeseries
-    _model_balloon = _model_balloon_fourier if method == 'fourier' else _model_balloon_ode
-    bold_coeffs = _model_balloon(activity_coeffs, dt, **params)
+    bold_coeffs = (_model_balloon_fourier(activity_coeffs, dt, padding_tol, **params)
+                   if method == 'fourier' else
+                   _model_balloon_ode(activity_coeffs, dt, **params))
 
     # Transform timeseries from modal coefficients back to vertex space
     return emodes @ bold_coeffs
@@ -422,9 +442,9 @@ def _gen_noise(
     # Consistent mass requires matrix factorisation
     from scipy.sparse.csgraph import reverse_cuthill_mckee
 
-    # Manually permute rows/cols of mass for reduced bandwidth and thus increased sparsity of L
-    # and U factors for efficiency. splu usually does this internally, but does not offer the
-    # option to ensure symmetric permutation, as is needed for L @ U = L @ D @ L.T (see below).
+    # Manually permute rows/cols of mass to reduce its bandwidth and thus increase sparsity of L and
+    # U factors for efficiency. splu usually does this internally, but does not offer the option to
+    # ensure symmetric permutation, as is needed for L @ U = L @ D @ L.T (see below).
     perm = reverse_cuthill_mckee(mass, symmetric_mode=True)
     inv_perm = np.argsort(perm)
     mass_perm = mass[perm, :][:, perm]
@@ -447,7 +467,8 @@ def _model_wave_fourier(
     dt: float,
     r: float,
     gamma: float,
-    evals: NDArray[np.floating]
+    evals: NDArray[np.floating],
+    padding_tol: float
 ) -> NDArray[np.floating]:
     """
     Simulates the time evolution of wave models for all modes using a frequency-domain approach.
@@ -468,6 +489,11 @@ def _model_wave_fourier(
         Damping rate of wave propagation in seconds^(-1).
     evals : np.ndarray
         The eigenvalues associated with each mode, with shape ``(n_modes,)``.
+    padding_tol : float
+        Tolerance for Fourier wrap-around artifacts, between ``0`` and ``1``. Lower values increase
+        the amount of zero-padding and thus the simulation time and memory usage. The number of
+        padding timepoints is given by -ln(``padding_tol``)/(``gamma``*``dt``), meaning that a value
+        of ``1`` at t=0 wraps around to a value of ``padding_tol`` at t=nt-1. Default is ``1e-5``.
 
     Returns
     -------
@@ -495,24 +521,28 @@ def _model_wave_fourier(
 
     # Pad input with zeros on negative side to ensure causality (system is only driven for t >= 0)
     # This is required for the correct Green's function solution of the damped wave equation.
-    input_coeffs_padded = np.pad(input_coeffs, ((0, 0), (nt, 0)), constant_values=0)
+    # NFT transfer function has a temporal envelope of exp(-gamma * t), so we can pad until this is
+    # below the padding tolerance.
+    t_pad = -np.log(padding_tol) / gamma
+    n_pad = int(np.ceil(t_pad / dt))
+    input_coeffs_padded = np.pad(input_coeffs, ((0, 0), (n_pad, 0)), constant_values=0)
 
     # Frequency-domain representation of the causal signal
     # Faster to use `rfft` here than `fftshift(ifft)` (original implementation)
     input_coeffs_f = np.fft.rfft(input_coeffs_padded, axis=1)
 
     # Frequencies for full signal
-    omega = -2 * np.pi * np.fft.rfftfreq(2*nt, d=dt) # keep consistent with _model_balloon_fourier
+    omega = -2 * np.pi * np.fft.rfftfreq(n_pad + nt, d=dt) # keep consistent with _model_balloon_fourier
 
     # Compute transfer function and apply it to frequency-domain input
     H = gamma**2 / (-omega**2 - 2j * omega * gamma + gamma**2 * (1 + r**2 * evals[:, None]))
     out_fft = H * input_coeffs_f
 
     # Inverse transform to time domain (irfft is fast)
-    out_full = np.fft.irfft(out_fft, n=2*nt, axis=1)
+    out_full = np.fft.irfft(out_fft, n=n_pad+nt, axis=1)
 
     # Return only the non-negative time part (t >= 0)
-    return out_full[:, nt:]
+    return out_full[:, n_pad:]
 
 def _model_wave_ode(
     input_coeffs: NDArray[np.floating],
@@ -590,11 +620,12 @@ def _model_wave_fem(
     input_w: NDArray[np.floating],
     mass: csc_matrix,
     stiffness: csc_matrix,
-    dt: float = 1e-4,
-    r: float = 17.4,
-    gamma: float = 116.0,
-    n_jobs: int = 1,
-    verbose: int = 0 # for Parallel only (consider making **Parallel_kwargs)
+    dt: float,
+    r: float,
+    gamma: float,
+    padding_tol: float,
+    n_jobs: int,
+    verbose: int # for Parallel only (consider making **Parallel_kwargs)
 ) -> NDArray[np.floating]:
     """
     Simulates the time evolution of wave models for all vertices using a finite element method (FEM)
@@ -617,6 +648,11 @@ def _model_wave_fem(
         Spatial length scale of wave propagation in millimeters. Default is ``17.4``.
     gamma : float, optional
         Damping rate of wave propagation in seconds^(-1). Default is ``116.0``.
+    padding_tol : float, optional
+        Tolerance for Fourier wrap-around artifacts, between ``0`` and ``1``. Lower values increase
+        the amount of zero-padding and thus the simulation time and memory usage. The number of
+        padding timepoints is given by -ln(``padding_tol``)/(``gamma``*``dt``), meaning that a value
+        of ``1`` at t=0 wraps around to a value of ``padding_tol`` at t=nt-1. Default is ``1e-5``.
     n_jobs : int, optional
         Number of parallel jobs to run. If not ``1``, ``joblib`` must be installed. Default is
         ``1``.
@@ -627,14 +663,16 @@ def _model_wave_fem(
 
     # Pad input with zeros on negative side to ensure causality (system is only driven for t >= 0)
     # This is required for the correct Green's function solution of the damped wave equation.
-    input_padded = np.pad(input_w, ((0, 0), (nt, 0)), constant_values=0)
+    t_pad = -np.log(padding_tol) / gamma
+    n_pad = int(np.ceil(t_pad / dt))
+    input_padded = np.pad(input_w, ((0, 0), (n_pad, 0)), constant_values=0)
 
     # Apply Fourier transform to get frequency-domain representation of the causal signal.
     input_padded_freqs = np.fft.rfft(input_padded, axis=1)
 
     # Compute components of NFT operator
     spatial = r**2 * stiffness
-    omega = -2 * np.pi * np.fft.rfftfreq(2*nt, dt)
+    omega = -2 * np.pi * np.fft.rfftfreq(nt+n_pad, dt)
     temporal = -omega**2 / gamma**2 - 2j * omega / gamma + 1
 
     # Main computation
@@ -660,14 +698,15 @@ def _model_wave_fem(
     phi_freqs = np.stack(cast(list[NDArray[np.complex128]], phi_freqs), axis=1)
 
     # Inverse transform to time domain
-    phi = np.fft.irfft(phi_freqs, axis=1, n=2*nt)
+    phi = np.fft.irfft(phi_freqs, axis=1, n=nt+n_pad)
 
     # Return only the non-negative time part (t >= 0)
-    return phi[:, nt:]
+    return phi[:, n_pad:]
 
 def _model_balloon_fourier(
     activity_coeffs: NDArray[np.floating],
     dt: float,
+    padding_tol: float,
     kappa: float = 0.65,
     tau: float = 0.98,
     alpha: float = 0.32,
@@ -690,6 +729,12 @@ def _model_balloon_fourier(
         nt).
     dt : float
         Time step in seconds.
+    padding_tol : float, optional
+        Tolerance for Fourier wrap-around artifacts, between ``0`` and ``1``. Lower values increase
+        the amount of zero-padding and thus the simulation time and memory usage. The number of
+        padding timepoints is given by -ln(``padding_tol``)/(``dt`` * min(``kappa``/2, 1/``tau``,
+        1/(``tau`` * ``alpha``))), meaning that a value of ``1`` at t=0 wraps around to a value of
+        approximately ``padding_tol`` at t=``nt``-1. Default is ``1e-5``.
     kappa : float, optional
         Signal decay rate in seconds^-1. Default is ``0.65``.
     tau : float, optional
@@ -732,18 +777,25 @@ def _model_balloon_fourier(
       4. Use irfft to return to the time domain (with appropriate shifts)
     """
     nt = activity_coeffs.shape[1]
+    
+    # Zero-pad input at t < 0 for causality
+    # Identify poles of transfer function by finding roots of its denominator
+    # Flow response transfer function (phi_hat_Fz) has a pole at s = -kappa/2
+    # BOLD response transfer function (phi_hat_yF) has poles at s = -1/tau and s = -1/(alpha*tau)
+    # Padding should compensate for the slowest-decaying of these poles, each given by e^(-s*t)
+    decay_eff = np.min((kappa / 2, 1 / tau, 1 / (alpha * tau)))
+    t_pad = -np.log(padding_tol) / decay_eff
+    n_pad = int(np.ceil(t_pad / dt))
+    activity_coeffs_padded = np.pad(activity_coeffs, ((0, 0), (n_pad, 0)), constant_values=0)
 
     # Calculate balloon model frequency response (Pang et al. 2016)
-    omega = -2 * np.pi * np.fft.rfftfreq(2*nt, d=dt)
+    omega = -2 * np.pi * np.fft.rfftfreq(nt+n_pad, d=dt)
     beta = (rho + (1 - rho) * np.log(1 - rho)) / rho
     phi_hat_Fz = 1 / (-(omega + 1j * 0.5 * kappa) ** 2 + w_f ** 2)
     phi_hat_yF = V_0 * (alpha * (k2 + k3) * (1 - 1j * tau * omega) 
                                 - (k1 + k2) * (alpha + beta - 1 - 1j * tau * alpha * beta * omega)
                                 ) / ((1 - 1j * tau * omega) * (1 - 1j * tau * alpha * omega))
     balloon_freq_response = phi_hat_yF * phi_hat_Fz
-
-    # Zero-pad input at t < 0 for causality
-    activity_coeffs_padded = np.pad(activity_coeffs, ((0, 0), (nt, 0)), constant_values=0)
 
     # Apply Fourier transform (implemented as rfft for speed)
     activity_coeffs_f = np.fft.rfft(activity_coeffs_padded, axis=1)
@@ -752,10 +804,10 @@ def _model_balloon_fourier(
     out_fft = balloon_freq_response[None, :] * activity_coeffs_f
 
     # Inverse transform back to timeseries (inverse of previous transform)
-    out_full = np.fft.irfft(out_fft, n=2*nt, axis=1)
+    out_full = np.fft.irfft(out_fft, n=nt+n_pad, axis=1)
 
     # Remove zero padding
-    return out_full[:, nt:]
+    return out_full[:, n_pad:]
 
 def _model_balloon_ode(
     activity_coeffs: NDArray[np.floating],
