@@ -242,6 +242,11 @@ class EigenSolver(Solver):
         ..  [4] Andreux, M., et al. (2015). Anisotropic Laplace-Beltrami Operators for Shape
             Analysis, Computer Vision. https://doi.org/10.1007/978-3-319-16220-1_21
         """
+        # For the LBO to be SPSD, hetero must be non-negative
+        if hetero is not None and np.any(hetero < 0):
+            warn("hetero contains negative values, which may result in negative Laplace-Beltrami "
+                 "eigenvalues. It is recommended that heterogeneity maps are first rescaled (e.g., via )")
+
         # Cache validation
         if not np.array_equal(hetero, self._hetero):
             self._stiffness = None  # hetero affects stiffness only
