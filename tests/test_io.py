@@ -1,23 +1,33 @@
 import os
 from pathlib import Path
 from tempfile import TemporaryDirectory
-from joblib import Memory
-from lapy import TriaMesh, TetMesh
-import numpy as np
-from pytest import raises
-from neuromodes.io import read_vol, read_surf, fetch_vol, fetch_surf, fetch_map, _set_cache
-from neuromodes.mesh import is_vol, check_vol, check_surf # TODO: remove these where possible, test more purely in test_mesh.py
+from unittest.mock import patch
 
-def test_fetch_surf():
+import numpy as np
+from lapy import TetMesh, TriaMesh
+from pytest import raises
+
+from neuromodes.io import (
+    _cache_output,
+    fetch_example_map,
+    fetch_example_surf,
+    fetch_example_vol,
+    read_surf,
+    read_vol,
+)
+from neuromodes.mesh import check_surf, check_vol, is_vol
+
+
+def test_fetch_example_surf():
     for hemi in ['L', 'R']:
         for species in ['human', 'macaque', 'marmoset']:
             for density in ['4k', '32k']:
                 if species != 'human' and density == '4k':
-                    with raises(ValueError, match="Surface data .* not found"):
-                        fetch_surf(species=species, hemi=hemi, density=density)
+                    with raises(FileNotFoundError, match="Surface data .* not found"):
+                        fetch_example_surf(species=species, hemi=hemi, density=density)
                     continue
 
-                surf, medmask = fetch_surf(species=species, hemi=hemi, density=density)
+                surf, medmask = fetch_example_surf(species=species, hemi=hemi, density=density)
                 assert surf.v.shape[0] > 0
                 assert surf.v.shape[1] == 3
                 assert surf.t.shape[0] > 0
@@ -28,17 +38,17 @@ def test_fetch_surf():
                 check_surf(surf)  # Should not raise
 
 def test_fetch_invalid_surf():
-    with raises(ValueError, match="Surface data .* not found"):
-        fetch_surf(surf_type='makessense')
+    with raises(FileNotFoundError, match="Surface data .* not found"):
+        fetch_example_surf(surf_type='makessense')
 
 def test_fetch_gradient():
-    grad = fetch_map('fcgradient1')
+    grad = fetch_example_map('fcgradient1')
     assert isinstance(grad, np.ndarray)
     assert grad.shape == (32492,)
 
 def test_fetch_invalid_map():
-    with raises(ValueError, match="Map 'sp-human_tpl-fsLR_den-32k_hemi-L_panshifu.func.gii'.*"):
-        fetch_map('panshifu')
+    with raises(FileNotFoundError, match="Map 'sp-human_tpl-fsLR_den-32k_hemi-L_panshifu.func.gii'.*"):
+        fetch_example_map('panshifu')
 
 def test_read_surf_dict():
     surf_data = {
@@ -61,7 +71,7 @@ def test_read_surf_vtk():
 
 def test_read_surf_invalid():
     invalid_path = Path(__file__).parent / 'test_data' / 'civilised_lunch.surf.vtk'
-    with raises(ValueError, match="File not found: .*civilised_lunch.surf.vtk"):
+    with raises(FileNotFoundError, match="File not found: .*civilised_lunch.surf.vtk"):
         read_surf(invalid_path)
 
 def test_read_surf_freesurfer():
@@ -80,15 +90,15 @@ def test_fetch_vol():
     # Check that we can load and validate everything
     for hemi in ['L', 'R']:
         for structure in ['thalamus', 'hippocampus', 'striatum']:
-            vol = fetch_vol(structure=structure, hemi=hemi)
+            vol = fetch_example_vol(structure=structure, hemi=hemi)
             check_vol(vol)  # Should not raise
         
-        mus = fetch_vol('cortex', species='mouse', template='AMBA')
+        mus = fetch_example_vol('cortex', species='mouse', template='AMBA')
         check_vol(mus)
 
 def test_fetch_invalid_vol():
-    with raises(ValueError, match="Volume data .* not found."):
-        fetch_vol('chillybin')
+    with raises(FileNotFoundError, match="Volume data .* not found."):
+        fetch_example_vol('chillybin')
 
 def test_read_vol_dict():
     verts = ([
@@ -126,7 +136,7 @@ def test_read_vol_vtk():
 
 def test_read_vol_invalid():
     invalid_path = Path(__file__).parent / 'test_data' / 'fossilised_lunch.tetra.vtk'
-    with raises(ValueError, match="Volume data not found: .*fossilised_lunch.tetra.vtk"):
+    with raises(FileNotFoundError, match="Volume data not found: .*fossilised_lunch.tetra.vtk"):
         read_vol(invalid_path)
 
 # TODO: also test dict reading by just converting other formats to dict
@@ -185,41 +195,52 @@ def test_mesh_dict():
     with raises(ValueError, match="Received an invalid dictionary for `geometry`."):
         is_vol(geom_invalid)
 
-def test_caching():
-    # Get CACHE_DIR
-    cache_dir = os.getenv("CACHE_DIR")
-
-    # Test with temporary directory
+def test_cache_output_with_temp_dir():
+    # Test with temporary directory and a simple function
     with TemporaryDirectory() as temp_cache_dir:
-        os.environ["CACHE_DIR"] = temp_cache_dir
-        
-        memory = _set_cache()
-        assert isinstance(memory, Memory)
-        assert str(memory.location) == temp_cache_dir
-    
-    # Restore original CACHE_DIR
-    if cache_dir is not None:
-        os.environ["CACHE_DIR"] = cache_dir
-    elif "CACHE_DIR" in os.environ:
-        del os.environ["CACHE_DIR"]
+        def add_one(x):
+            return x + 1
+        cached_func = _cache_output(add_one, cache_dir=temp_cache_dir)
+        assert callable(cached_func)
+        assert cached_func(2) == 3
 
-def test_caching_default_dir(capsys):
+def test_cache_output_default_dir(capsys):
     # Temporarily unset CACHE_DIR
     cache_dir = os.getenv("CACHE_DIR")
     if "CACHE_DIR" in os.environ:
         del os.environ["CACHE_DIR"]
 
     try:
-        # Invoke _set_cache and check default directory
-        memory = _set_cache()
+        def add_two(x):
+            return x + 2
+        cached_func = _cache_output(add_two)
         expected_dir = Path.home() / ".neuromodes_cache"
-
-        assert isinstance(memory, Memory)
-        assert memory.location == expected_dir
+        assert callable(cached_func)
+        assert cached_func(2) == 4
 
         print_log = capsys.readouterr().out
-        assert f"Using default cache directory at {expected_dir}" in print_log
+        assert f"Using cache directory at {expected_dir}" in print_log
     finally:
         # Restore original CACHE_DIR
         if cache_dir is not None:
             os.environ["CACHE_DIR"] = cache_dir
+
+def test_cache_output_caches_result(tmp_path):
+    calls = []
+    def func(x):
+        calls.append(x)
+        return x * 2
+
+    cached_func = _cache_output(func, cache_dir=tmp_path)
+    # First call: should append to calls
+    assert cached_func(5) == 10
+    assert calls == [5]
+    # Second call: should NOT append to calls (uses cache)
+    assert cached_func(5) == 10
+    assert calls == [5]  # No new call, so still [5]
+
+def test_caching_no_joblib():
+    # Mock the import of joblib to raise ImportError
+    with (patch.dict('sys.modules', {'joblib': None}),
+          raises(ImportError, match="joblib is required for caching")):
+        _cache_output(lambda x: x)

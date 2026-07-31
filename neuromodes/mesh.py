@@ -1,19 +1,22 @@
 """
-Module for reading, validating, manipulating, and creating meshes of brain structures.
+Module for validating and manipulating meshes of brain structures.
 """
 
 from __future__ import annotations
+
 from pathlib import Path
-from typing import Union, TYPE_CHECKING
+from typing import TYPE_CHECKING
 from warnings import warn
-from lapy import TriaMesh, TetMesh
+
+import numpy as np
+from lapy import TetMesh, TriaMesh
 from nibabel.affines import apply_affine
-from nibabel.nifti1 import Nifti1Image
 from nibabel.gifti.gifti import GiftiImage
 from nibabel.loadsave import load
-import numpy as np
-from scipy.interpolate import griddata, RBFInterpolator
+from nibabel.nifti1 import Nifti1Image
+from scipy.interpolate import RBFInterpolator, griddata
 from scipy.sparse.linalg import splu
+
 from neuromodes.io import fs_extensions
 
 if TYPE_CHECKING:
@@ -21,7 +24,7 @@ if TYPE_CHECKING:
     from scipy.sparse import csc_matrix
 
 def is_vol(
-    geometry: Union[TetMesh, TriaMesh, GiftiImage, str, Path, dict]
+    geometry: TetMesh | TriaMesh | GiftiImage | str | Path | dict
 ) -> bool:
     """
     Determine whether the given geometry represents a volume or surface mesh.
@@ -81,99 +84,105 @@ def is_vol(
         raise ValueError(err_str)
 
 def mask_mesh(
-    geometry: Union[TriaMesh, TetMesh],
-    mask: ArrayLike
-) -> Union[TriaMesh, TetMesh]:
+    geometry: TriaMesh,
+    mask: NDArray[np.bool_]
+) -> TriaMesh:
     """
-    Remove specified vertices and corresponding elements from a triangular surface or tetrahedral
-    volume mesh. Returns a `lapy.TriaMesh` or `lapy.TetMesh` object.
+    Remove specified vertices and corresponding faces from a triangular surface mesh. Note that this
+    may produce a non-contiguous mesh with unreferenced vertices--use :func:`check_surf` to validate
+    the resulting mesh.
 
     Parameters
     ----------
-    geometry : lapy.TriaMesh or lapy.TetMesh
-        The input surface or volume mesh.
+    geometry : lapy.TriaMesh
+        The input surface mesh.
     mask : array-like
-        A boolean array indicating which vertices to keep (`True`) or remove (`False`).
+        A boolean array indicating which vertices to keep (``True``) or remove (``False``).
 
     Returns
     -------
-    lapy.TriaMesh or lapy.TetMesh
-        The masked surface or volume mesh.
+    lapy.TriaMesh
+        The masked surface mesh.
 
     Raises
     ------
     ValueError
-        If `mask` does not have a length matching the number of vertices in `geometry`.
+        If ``mask`` does not have a length matching the number of vertices in ``geometry``.
     """
     # Format / validate arguments
     mask = np.asarray_chkfinite(mask, dtype=bool)
     if mask.shape != (geometry.v.shape[0],):
-        raise ValueError(f"`mask` must have shape (n_verts,) = ({geometry.v.shape[0]},).")
+        raise ValueError(f"mask must have shape ({geometry.v.shape[0]},), matching the number of "
+                         "vertices in geometry.")
 
     # Remove vertices not in mask
-    v_masked = geometry.v[mask]
+    v_masked = geometry.v[mask] # inherit original type
 
-    # Update vertex indices of elements (-1 represents removed vertices)
-    v_map = np.full(len(mask), -1, dtype=int)
-    v_map[mask] = np.arange(np.sum(mask))
+    # Update vertex indices of elements
+    v_map = unmask_data(np.arange(np.sum(mask)), mask, fill_value=0).astype(geometry.t.dtype) 
     t_remapped = v_map[geometry.t]
     
     # Keep only elements where all vertices are in the mask
-    elem_mask = np.all(t_remapped != -1, axis=1)
+    elem_mask = np.all(mask[geometry.t], axis=1)
     t_masked = t_remapped[elem_mask]
 
-    # Create a new TriaMesh or TetMesh with the masked vertices and elements
+    # Create a new TriaMesh with the masked vertices and elements
     return geometry.__class__(v=v_masked, t=t_masked)
 
 def unmask_data(
-    data: ArrayLike,
-    mask: ArrayLike,
-    fill_val: float = np.nan
-) -> NDArray:
+    data: NDArray[np.floating],
+    mask: NDArray[np.bool_],
+    fill_value: float = np.nan
+) -> NDArray[np.floating]:
     """
     Unmasks data by inserting it into a full array with the same length as the medial wall mask.
 
     Parameters
     ----------
     data : numpy.ndarray
-        The data to be unmasked, which should have the same number of rows as the number of True
-        values in `mask`. Can be 1D or 2D (n_masked_verts, n_maps).
+        The data to be unmasked, of shape ``(n_verts)`` or ``(n_verts, ...)``, where ``n_verts`` is
+        the number of vertices in the masked mesh and additional axes represent maps to be unmasked
+        independently.
     mask : numpy.ndarray
-        A boolean array where True indicates the positions of the data in the full array.
-    fill_val : float, optional
-        The value to fill in the positions outside the mask. Default is np.nan.
+        A boolean array-like of shape ``(n_verts + n_extra_verts)``, where ``True`` indicates the
+        positions of the data in the full array. Must contain exactly ``n_verts`` ``True`` values.
+    fill_value : float, optional
+        The value to fill in the positions outside the mask. Default is NaN.
 
     Returns
     -------
     numpy.ndarray
-        The unmasked data, with the same shape as the medial mask.
+        The unmasked data of shape ``(n_verts + n_extra_verts)`` or
+        ``(n_verts + n_added_verts, n_maps)``.
 
     Raises
     ------
     ValueError
-        If `mask` is not a 1D boolean array.
+        If ``mask`` is not a 1D boolean array.
     ValueError
-        If `data` does not have shape (n_masked_verts,) or (n_masked_verts, n_maps), where
-        n_masked_verts is the number of True values in `mask`.
+        If ``data`` does not have shape ``(n_verts,)`` or ``(n_verts, n_maps)``.
     """
-    # Format / validate arguments
-    data = np.asarray(data)
+    # Format / validate arguments (TODO: use EigenData)
     mask = np.asarray_chkfinite(mask, dtype=bool)
     if mask.ndim != 1:
         raise ValueError("`mask` must be a 1D boolean array.")
-    if data.ndim not in [1, 2] or data.shape[0] != np.sum(mask):
-        raise ValueError(
-            "`data` must have shape (n_masked_verts,) or (n_masked_verts, n_maps), where "
-            f"n_masked_verts is the number of True values in `mask` ({np.sum(mask)})."
-            )
-    n_verts = len(mask)
-    out_shape = (n_verts, data.shape[1]) if data.ndim == 2 else (n_verts,)
+    
+    data = np.asarray(data)
+    if data.shape[0] != np.sum(mask):
+        raise ValueError("`data` must have shape (n_verts,...), where n_verts "
+                         f"matches the number of True values in `mask` ({np.sum(mask)}).")
+    
+    # out_size
+    out_size = (len(mask),) + data.shape[1:]
 
+    # out_dtype: the safest dtype that can hold BOTH the data and the fill_value
+    out_dtype = np.result_type(data.dtype, np.array(fill_value).dtype)
+    
     # Initialise array of fill values
-    data_unmasked = np.full(out_shape, fill_val)
+    data_unmasked = np.full(out_size, fill_value, dtype=out_dtype)
 
     # Overwrite rows with data where mask is True
-    data_unmasked[mask] = data
+    data_unmasked[mask, ...] = data
 
     return data_unmasked
 
@@ -290,7 +299,7 @@ def check_surf(
     Raises
     ------
     ValueError
-        If the surface mesh contains unreferenced vertices.
+        If the surface mesh contains unreferenced (i.e., faceless) vertices.
     ValueError
         If the surface mesh is not contiguous.
     ValueError
@@ -301,7 +310,7 @@ def check_surf(
     referenced[surf.t] = True
     if not np.all(referenced):
         raise ValueError(f'Surface mesh contains {np.sum(~referenced)} unreferenced '
-                         'vertices (i.e., not part of any face).')
+                         '(i.e., faceless) vertices.')
 
     # Ensure surface is contiguous
     n_components = surf.connected_components()[0]
@@ -317,7 +326,7 @@ def check_surf(
 def tetmesh_to_nifti(
     data: ArrayLike,
     tetmesh: TetMesh,
-    nifti_mask: Union[str, Path, Nifti1Image],
+    nifti_mask: str | Path | Nifti1Image,
     method: str = 'nearest',
     **rbf_kwargs
 ) -> Nifti1Image:
@@ -337,13 +346,13 @@ def tetmesh_to_nifti(
     # Format / validate arguments
     data = np.asarray_chkfinite(data)
     if data.shape != (tetmesh.v.shape[0],):
-        raise ValueError(f"`data` must have shape ({tetmesh.v.shape[0]},), got {data.shape}.")
+        raise ValueError(f"data must have shape ({tetmesh.v.shape[0]},), got {data.shape}.")
     if not isinstance(tetmesh, TetMesh):
-        raise ValueError("`tetmesh` must be an instance of `lapy.TetMesh`.")
+        raise TypeError("tetmesh must be an instance of lapy.TetMesh.")
     if isinstance(nifti_mask, (str, Path)):
         nifti_mask = load(nifti_mask)
     elif not isinstance(nifti_mask, Nifti1Image):
-        raise ValueError("nifti_mask must be a Nifti1Image object or a path-like string to a valid "
+        raise TypeError("nifti_mask must be a Nifti1Image object or a path-like string to a valid "
                          "`.nii` or `.nii.gz` file.")
     
     # Get coordinates of nonzero voxels in physical space
@@ -368,11 +377,11 @@ def tetmesh_to_nifti(
     return Nifti1Image(interp_data, nifti_mask.affine, header=header)
 
 def nifti_to_tetmesh(
-    nifti_data: Union[str, Path, Nifti1Image],
+    nifti_data: str | Path | Nifti1Image,
     tetmesh: TetMesh,
-    nifti_mask: Union[str, Path, Nifti1Image, None] = None,
+    nifti_mask: str | Path | Nifti1Image | None = None,
     **rbf_kwargs
-) -> NDArray:
+) -> NDArray[np.floating]:
     """
     Project data from volumetric NIFTI space to a tetrahedral mesh using RBF interpolation.
     
@@ -401,7 +410,7 @@ def nifti_to_tetmesh(
     if isinstance(nifti_data, (str, Path)):
         nifti_data = load(nifti_data)
     elif not isinstance(nifti_data, Nifti1Image):
-        raise ValueError("nifti_data must be a Nifti1Image object or path")
+        raise TypeError("nifti_data must be a Nifti1Image object or path")
     
     # Get mask
     data = nifti_data.get_fdata()
@@ -429,7 +438,7 @@ def nifti_to_tetmesh(
     return interp_data
 
 def make_vol_mesh(
-    vol: Union[str, Path, Nifti1Image],
+    vol: str | Path | Nifti1Image,
     closings: int = 0,
     discard_components: bool = False,
     method: str = 'gmsh',
@@ -439,15 +448,15 @@ def make_vol_mesh(
     Tetrahedral meshing using Gmsh's python API and marching cubes algorithm.
     Returns a lapy.TetMesh object.
     """
-    from skimage.measure import marching_cubes
     from scipy.ndimage import binary_closing
+    from skimage.measure import marching_cubes
     from tetgen import TetGen
 
     # Format / validate arguments
     if isinstance(vol, (str, Path)):
         vol = load(vol)
     elif not isinstance(vol, Nifti1Image):
-        raise ValueError("vol must be a Nifti1Image object or a path-like string to a valid "
+        raise TypeError("vol must be a Nifti1Image object or a path-like string to a valid "
                          "`.nii` or `.nii.gz` file.")
     if closings != int(closings) or closings < 0:
         raise ValueError("Parameter `closings` must be a non-negative integer.")

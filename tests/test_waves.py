@@ -1,26 +1,31 @@
-import pytest
 import os
 from tempfile import TemporaryDirectory
-import numpy as np
-from neuromodes.io import fetch_surf
-from neuromodes.eigen import EigenSolver
-from neuromodes.waves import (simulate_waves, calc_wave_speed, get_balloon_params,
-                              _simulate_waves_fem)
+from unittest.mock import patch
 
-@pytest.fixture
+import numpy as np
+import pytest
+
+from neuromodes import EigenSolver
+from neuromodes.io import fetch_example_map, fetch_example_surf
+from neuromodes.stats import sigmoid_rescale, zscorew
+from neuromodes.waves import _analytical_fc, _gen_noise, calc_wave_speed, sim_nft_waves
+
+
+@pytest.fixture(scope="module")
 def solver():
-    rng = np.random.default_rng(0)
-    mesh, medmask = fetch_surf(density='4k')
-    hetero = rng.standard_normal(size=sum(medmask))
-    return EigenSolver(mesh, mask=medmask, hetero=hetero).solve(n_modes=100, seed=0)
+    mesh, medmask = fetch_example_surf(density='4k')
+    myelinmap = fetch_example_map(data="myelinmap", density="4k")[medmask]
+    solver = EigenSolver(mesh, mask=medmask)
+    hetero = sigmoid_rescale(zscorew(myelinmap, solver.mass), steepness=1.0, upper=2.0)
+    return solver.solve(n_modes=100, hetero=hetero)
 
 def test_unusual_wave_speed(solver):
-    with pytest.warns(UserWarning, match=r'range of 0-150 m/s \(calculated 23.3-160.4 m/s\).'):
-        solver.simulate_waves(r=1000, nt=10)
+    with pytest.warns(UserWarning, match=r'range of 0-150 m/s \(calculated 47.1-162.6 m/s\).'):
+        solver.sim_nft_waves(r=1000, nt=10)
 
 def test_unusual_wave_speed_no_hetero(solver):
     with pytest.warns(UserWarning, match=r'range of 0-115 m/s \(calculated 116.0 m/s\).'):
-        simulate_waves(
+        sim_nft_waves(
             solver.emodes,
             solver.evals,
             mass=solver.mass,
@@ -30,14 +35,14 @@ def test_unusual_wave_speed_no_hetero(solver):
             )
 
 def test_single_speed_limit(solver):
-    with pytest.raises(ValueError, match="`speed_limits` must be a tuple"):
-        solver.simulate_waves(nt=10, r=18.0, speed_limits=150)
+    with pytest.raises(ValueError, match="speed_limits must be a tuple"):
+        solver.sim_nft_waves(nt=10, r=18.0, speed_limits=150)
 
 def test_reversed_speed_limits(solver):
-    with pytest.raises(ValueError, match="`speed_limits` must be a tuple"):
-        solver.simulate_waves(nt=10, r=18.0, speed_limits=(150, 0))
+    with pytest.raises(ValueError, match="speed_limits must be a tuple"):
+        solver.sim_nft_waves(nt=10, r=18.0, speed_limits=(150, 0))
 
-def test_simulate_waves_impulse(solver):
+def test_sim_nft_waves_impulse(solver):
 
     # Simulate timeseries with a 10ms impulse of white noise to the cortex
     dt = 1e-3
@@ -49,8 +54,8 @@ def test_simulate_waves_impulse(solver):
     ext_input = np.zeros((solver.n_verts, nt))
     ext_input[:, i_start:i_stop] = impulse[:, np.newaxis]
 
-    fourier_ts = solver.simulate_waves(ext_input=ext_input, dt=dt)
-    ode_ts = solver.simulate_waves(ext_input=ext_input, dt=dt, pde_method='ode')
+    fourier_ts = solver.sim_nft_waves(ext_input=ext_input, dt=dt)
+    ode_ts = solver.sim_nft_waves(ext_input=ext_input, dt=dt, method='ode')
 
     # Check output shapes
     assert fourier_ts.shape == (solver.n_verts, nt), 'Fourier output shape is incorrect.'
@@ -68,75 +73,91 @@ def test_simulate_waves_impulse(solver):
     assert np.allclose(ode_ts[:, -1], 0, atol=1e-8), \
         'ODE activity is not negligible after 200ms.'
 
-def test_simulate_waves_methods(solver):
+def test_sim_nft_waves_methods(solver):
 
     nt = 100
     dt = 1e-4
     seed = 0
 
     # Check that Fourier and ODE methods produce similar neural activity at selected timepoints
-    fourier_ts = solver.simulate_waves(nt=nt, dt=dt, seed=seed)
-    ode_ts = solver.simulate_waves(nt=nt, dt=dt, seed=seed, pde_method='ode')
+    fourier_ts = solver.sim_nft_waves(nt=nt, dt=dt, seed=seed)
+    ode_ts = solver.sim_nft_waves(nt=nt, dt=dt, seed=seed, method='ode')
 
     for t in range(50, nt):
         assert np.corrcoef(fourier_ts[:, t], ode_ts[:, t])[0, 1] > 0.85, \
             f'Fourier and ODE solutions are not correlated at r>.85 at t={t}.'
 
-def test_simulate_waves_methods_bold(solver):
+def test_sim_nft_waves_methods_bold(solver):
 
     nt = 100
     dt = 1e-2
     seed = 0
 
     # Check that Fourier and ODE methods produce similar BOLD signal at selected timepoints
-    activity_fourier = solver.simulate_waves(nt=nt, dt=dt, seed=seed)
-    activity_ode = solver.simulate_waves(nt=nt, dt=dt, seed=seed, pde_method='ode')
-    bold_fourier = solver.bold_transform(activity_fourier, dt=dt)
-    bold_ode = solver.bold_transform(activity_ode, dt=dt, pde_method='ode')
+    activity_fourier = solver.sim_nft_waves(nt=nt, dt=dt, seed=seed)
+    activity_ode = solver.sim_nft_waves(nt=nt, dt=dt, seed=seed, method='ode')
+    bold_fourier = solver.balloon_model(activity_fourier, dt=dt)
+    bold_ode = solver.balloon_model(activity_ode, dt=dt, method='ode')
 
     # Methods converge to r=.98 by t=500, but this takes too long to run, so just anchor the test
-    # to a lower value to catch if the alignment ever drops
+    # to a lower value to catch if the alignment ever drops (TODO: add to validation?)
     for t in range(75, nt):
         assert np.corrcoef(bold_fourier[:, t], bold_ode[:, t])[0, 1] > 0.6, \
             f'Fourier and ODE BOLD solutions are not correlated at r>.6 at t={t}.'
+        
+# TODO: add test that BOLD FC is very similar to neural FC
+        
+def test_gen_noise_reproducibility():
+    seed = 0
+    noise1 = _gen_noise(5, 10, seed=seed)
+    noise2 = _gen_noise(5, 20, seed=seed)
+    assert (noise1 == noise2[:, :10]).all(), \
+        "Noise generated with the same seed does not match across different nt."
 
-def test_simulate_waves_reproducibility_fourier(solver):
+def test_sim_nft_waves_reproducibility_fourier(solver):
     
     nt = 100
-    dt = 1e-1
-    seed = 36
+    dt = 1e-2
+    seed = 0
+    
+    # Same seed should be reproducible across different nt
+    ts0 = solver.sim_nft_waves(nt=nt, dt=dt, seed=seed)
+    ts1 = solver.sim_nft_waves(nt=2*nt, dt=dt, seed=seed)
 
-    ts1 = solver.simulate_waves(nt=nt, dt=dt, seed=seed)    
-    ts2 = solver.simulate_waves(nt=nt, dt=dt, seed=seed)
-    ts3 = solver.simulate_waves(nt=nt, dt=dt, seed=seed+1)
+    # Different seed should produce different results
+    ts2 = solver.sim_nft_waves(nt=nt, dt=dt, seed=seed+1)
 
-    assert np.allclose(ts1, ts2), "Simulations with the same seed do not match."
-    assert not np.allclose(ts1, ts3), "Simulations with different seeds match unexpectedly."
+    mse01 = np.mean((ts0 - ts1[:, :nt])**2)
+    mse02 = np.mean((ts0 - ts2)**2)
+    assert mse01 < 1e-5, \
+        f"Simulated timeseries with the same seed do not match (MSE={mse01:.4e})."
+    assert mse02 > 1e-3, \
+        f"Simulated timeseries with different seeds match unexpectedly (MSE={mse02:.4f})."
 
-def test_simulate_waves_invalid_input_shape(solver):
+def test_sim_nft_waves_invalid_input_shape(solver):
 
-    with pytest.raises(ValueError, match=r"n_verts is the number of rows in `emodes` \(3636\)."):
-        solver.simulate_waves(ext_input=np.ones((4002, 1000)))
+    with pytest.raises(ValueError, match=r"data.*first dimension.*3619"):
+        solver.sim_nft_waves(ext_input=np.ones((4002, 1000)))
 
-def test_simulate_waves_invalid_pde_method(solver):
+def test_sim_nft_waves_invalid_method(solver):
 
     with pytest.raises(ValueError, match="Invalid PDE method 'zote'"):
-        solver.simulate_waves(pde_method='zote')
+        solver.sim_nft_waves(nt=10, method='zote')
 
 @pytest.mark.filterwarnings("ignore:overflow encountered in scalar power:RuntimeWarning")
 @pytest.mark.filterwarnings("ignore:invalid value encountered in dot:RuntimeWarning")
 @pytest.mark.filterwarnings("ignore:invalid value encountered in scalar subtract:RuntimeWarning")
-def test_simulate_waves_ode_balloon_overflow(solver):
+def test_sim_nft_waves_ode_balloon_overflow(solver):
 
-    # Large `dt` can cause overflow errors in the `dqdt` expression for the ODE balloon model, so
+    # Large dt can cause overflow errors in the dqdt expression for the ODE balloon model, so
     # test that our error is raised
     dt = 1
 
     with pytest.raises(RuntimeError, match="message: Required step size is less than spacing"):
-        activity = solver.simulate_waves(dt=dt, nt=10, pde_method='ode')
-        solver.bold_transform(activity, pde_method='ode', dt=dt)
+        activity = solver.sim_nft_waves(dt=dt, nt=10, method='ode')
+        solver.balloon_model(activity, method='ode', dt=dt)
 
-def test_simulate_waves_cached(solver):
+def test_sim_nft_waves_cached(solver):
     # Get CACHE_DIR
     cache_dir = os.getenv("CACHE_DIR")
 
@@ -144,7 +165,7 @@ def test_simulate_waves_cached(solver):
     try:
         with TemporaryDirectory() as temp_cache_dir:
             os.environ["CACHE_DIR"] = temp_cache_dir
-            _ = solver.simulate_waves(nt=10, cache_input=True, seed=0)
+            _ = solver.sim_nft_waves(nt=10, cache_input=True, seed=0)
 
             # Check that the temp_cache_dir/neuromodes/waves subdirectory exists
             cache_dir_waves = os.path.join(
@@ -160,53 +181,62 @@ def test_simulate_waves_cached(solver):
         else:
             del os.environ["CACHE_DIR"]
 
-def test_simulate_waves_balloon_param(solver):
+def test_sim_nft_waves_balloon_param(solver):
     nt = 100
     dt = 1e-2
 
-    activity = solver.simulate_waves(nt=nt, dt=dt)
-    bold_default = solver.bold_transform(activity, dt=dt)
-    bold_custom = solver.bold_transform(activity, dt=dt, rho=0.5)
+    activity = solver.sim_nft_waves(nt=nt, dt=dt)
+    bold_default = solver.balloon_model(activity, dt=dt)
+    bold_custom = solver.balloon_model(activity, dt=dt, rho=0.5)
 
     assert not np.allclose(bold_default, bold_custom), \
         "BOLD signals with different balloon model parameters match unexpectedly."
-    
-def test_get_balloon_params():
-
-    # Check a default
-    params = get_balloon_params()
-    assert params['rho'] == 0.34, "Default parameter 'rho' is incorrect."
-
-    # Check an override
-    params = get_balloon_params(rho=0.5)
-    assert params['rho'] == 0.5, "Overridden parameter 'rho' is incorrect."
-
-    # Check an invalid override
-    with pytest.raises(ValueError, match=r"\(received rho=0\)."):
-        _ = get_balloon_params(rho=0)
-
-    # Check an invalid parameter name
-    with pytest.raises(ValueError, match="Invalid Balloon model parameter 'yoyoyo'."):
-        _ = get_balloon_params(yoyoyo=1.0)
 
 def test_calc_wave_speed(solver):
 
     # Homogeneous case
     speed = calc_wave_speed(r=18.0, gamma=116)
-    assert isinstance(speed, float), "Output type is not float for `hetero=None`."
+    assert isinstance(speed, float), "Output type is not float for hetero=None."
 
     # Heterogeneous case
-    speed = calc_wave_speed(r=18.0, gamma=116, scaled_hetero=solver.hetero)
-    assert np.all(speed > 0), "Output contains non-positive wave speeds when using `scaled_hetero`."
-    assert speed.shape == (solver.n_verts,), "Output shape is incorrect when using `scaled_hetero`."
+    speed = calc_wave_speed(r=18.0, gamma=116, hetero=solver.hetero)
+    assert np.all(speed > 0), "Output contains non-positive wave speeds when using hetero."
+    assert speed.shape == (solver.n_verts,), "Output shape is incorrect when using hetero." # type: ignore
+
+def test_analytical_fc(solver):
+    sim_ts = solver.sim_nft_waves(nt=1000, dt=0.1, seed=0)
+    # Check that simulated FC from waves aligns with the analytical FC
+    ana_fc = _analytical_fc(solver.emodes, solver.evals, r=17.4)
+    sim_fc = np.corrcoef(sim_ts)
+    mse = np.mean((ana_fc - sim_fc)**2)
+    assert mse < 0.01, f"Analytical FC does not align with simulated FC (MSE={mse:.4f})."
 
 def test_fem_alignment(solver):
     # Check that modal approximation aligns with FEM solution
     nt=50
-    dt=0.01
+    dt=0.1
+    seed=0
 
-    modal_ts = solver.simulate_waves(nt=nt, dt=dt, seed=0)
-    fem_ts = _simulate_waves_fem(solver.mass, solver.stiffness, nt=nt, dt=dt, seed=0)
+    fourier_ts = solver.sim_nft_waves(nt=nt, dt=dt, seed=seed)
+
+    # Run FEM simulation
+    fem_ts = solver.sim_nft_waves(nt=nt, dt=dt, seed=seed, n_jobs=1, method='fem')
+
+    # Assess
     for t in range(10, nt):
-        assert np.corrcoef(modal_ts[:, t], fem_ts[:, t])[0, 1] > 0.8, \
+        assert np.corrcoef(fourier_ts[:, t], fem_ts[:, t])[0, 1] > 0.8, \
             f'Modal and FEM solutions are not correlated at r>.8 at t={t}.'
+
+def test_fem_no_joblib(solver):
+    # Check that FEM simulation runs without joblib installed
+    nt=50
+    dt=0.1
+    seed=0
+
+    with patch.dict('sys.modules', {'joblib': None}):
+        with pytest.warns(UserWarning, match="joblib is not installed"):
+            fem_ts = solver.sim_nft_waves(nt=nt, dt=dt, seed=seed, n_jobs=-1, method='fem')
+
+        assert fem_ts.shape == (solver.n_verts, nt), \
+            "FEM output shape is incorrect when joblib is not installed."
+        

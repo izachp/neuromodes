@@ -1,7 +1,9 @@
-from lapy import TriaMesh, TetMesh
 import numpy as np
+from lapy import TetMesh, TriaMesh
 from pytest import raises
-from neuromodes.mesh import mask_mesh, check_vol, check_surf
+
+from neuromodes.mesh import check_surf, check_vol, mask_mesh
+
 
 def test_mask_surf():
 
@@ -39,7 +41,7 @@ def test_surf_unreferenced_verts():
     invalid_mesh = TriaMesh(v=vertices, t=faces)
    
     # check_surf should raise ValueError due to unreferenced vertex
-    with raises(ValueError, match="Surface mesh contains .* unreferenced vertices"):
+    with raises(ValueError, match="Surface mesh contains .* unreferenced"):
         check_surf(invalid_mesh)
 
 def test_surf_not_contiguous():
