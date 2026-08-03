@@ -19,11 +19,10 @@ def test_vol_modes():
                 vol = fetch_example_vol(structure=structure, hemi=hemi)
 
             # test hetero while we're at it
-            hetero = np.abs(np.random.default_rng().standard_normal(vol.v.shape[0]))
+            hetero = np.abs(np.random.default_rng(0).standard_normal(vol.v.shape[0]))
             solver = EigenSolver(vol).solve(10, hetero=hetero, seed=0)
 
             # check that evals are in ascending order
-            print(f"Eigenvalues for {structure} {hemi}: {solver.evals}")
             assert np.all(np.diff(solver.evals) > 0), \
                 f"Eigenvalues are not sorted in ascending order for {structure} {hemi}."
 
@@ -102,16 +101,26 @@ def test_hetero_ones(surf_medmask):
 
 def test_real_heteromaps():
     mesh, medmask = fetch_example_surf() # 32k density to match included maps
-    for map in ['fcgradient1', 'myelinmap', 'ndi', 'odi', 'thickness']:
-        hetero = fetch_example_map(map)[medmask]
-        # just test that LBO can be computed without error
-        EigenSolver(mesh, mask=medmask).compute_lbo(hetero=hetero)
+    solver = EigenSolver(mesh, mask=medmask)
+
+    map_names = ['fcgradient1', 'myelinmap', 'ndi', 'odi', 'thickness']
+    heteros = np.stack([fetch_example_map(m)[medmask] for m in map_names], axis=1)
+    heteros_z = zscorew(heteros, solver.mass)
+    heteros_zsig = sigmoid_rescale(heteros_z, upper=2)
+
+    # just test that LBO can be computed without error
+    for i in range(len(map_names)):
+        solver.compute_lbo(hetero=heteros_zsig[:, i])
 
 def test_symmetric_mass(presolver):
     diff = presolver.mass - presolver.mass.transpose()
     assert abs(diff).max() == 0, 'Mass matrix is not symmetric.'
 
-# TODO: test that lumped mass is the same as summed consistent mass
+def test_mass_rowsums(presolver):
+    mass_rowsums = presolver.mass.sum(axis=1).A1
+    mass_lumped = EigenSolver(presolver.geometry).compute_lbo(lump=True).mass.data
+    np.testing.assert_allclose(mass_rowsums, mass_lumped,
+                                  err_msg='Mass matrix row sums do not match lumped mass diagonal.')
 
 def test_symmetric_stiffness(presolver):
     diff = presolver.stiffness - presolver.stiffness.transpose()
@@ -264,11 +273,10 @@ def test_normalized_surf(solver):
 def test_normalized_vol():
     # Above test but for volumes
     hippo = fetch_example_vol('hippocampus')
-    hetero = np.random.default_rng(0).standard_normal(hippo.v.shape[0])
 
-    volser = EigenSolver(hippo).solve(16, hetero=hetero, seed=0)
+    volser = EigenSolver(hippo).solve(16, seed=0)
     evals_lapy = normalize_ev(volser.geometry, volser.evals)
-    volser_norm = EigenSolver(normalize_vol(hippo)).solve(16, hetero=hetero, seed=0)
+    volser_norm = EigenSolver(normalize_vol(hippo)).solve(16, seed=0)
 
     assert np.allclose(evals_lapy, volser_norm.evals, atol=1e-20), \
     'Evals from LaPy normalization do not match evals from EigenSolver normalization.'

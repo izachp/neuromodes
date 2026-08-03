@@ -162,9 +162,6 @@ API Reference
    neuromodes.mesh.normalize_vol
    neuromodes.mesh.check_vol
    neuromodes.mesh.check_surf
-   neuromodes.mesh.tetmesh_to_nifti
-   neuromodes.mesh.nifti_to_tetmesh
-   neuromodes.mesh.make_vol_mesh
 
 .. _ref_nulls:
 
@@ -199,5 +196,7 @@ API Reference
    :toctree: generated/
 
    read_surf
+   read_vol
    fetch_example_surf
+   fetch_example_vol
    fetch_example_map
