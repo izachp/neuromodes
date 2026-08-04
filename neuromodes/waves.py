@@ -16,6 +16,7 @@ from scipy.sparse.linalg import splu
 
 from neuromodes.basis import decompose
 from neuromodes.eigen import EigenData
+from neuromodes.stats import _mult_by_sqrtmass
 
 if TYPE_CHECKING:
     from typing import Literal
@@ -38,7 +39,7 @@ def sim_nft_waves(
     stiffness: csc_matrix | None = None, # only used for FEM
     speed_limits: tuple[float, float] | None = (0, 150),
     hetero: NDArray[np.floating] | None = None,
-    padding_tol: np.floating = 1e-5,
+    padding_tol: np.floating | Literal['nt'] = 1e-5,
     checks: _CheckKind = True,
     seed: int | None = None,
     cache_input: bool = False,
@@ -197,8 +198,8 @@ def sim_nft_waves(
                  "plausible wave speeds, or adjust speed_limits.")
     if method not in ['fourier', 'ode', 'fem']:
         raise ValueError(f"Invalid PDE method '{method}'; must be 'fourier', 'ode', or 'fem'.")
-    if padding_tol <= 0 or padding_tol > 1:
-        raise ValueError("padding_tol must be between 0 and 1.")
+    if (padding_tol <= 0 or padding_tol > 1) and padding_tol != 'nt':
+        raise ValueError("padding_tol must be between 0 and 1, or 'nt'.")
     if n_jobs != 1:
         if method != 'fem':
             warn("n_jobs is ignored when method is not 'fem'.")
@@ -218,7 +219,7 @@ def sim_nft_waves(
             mode_idx = np.argmax(~modes_is_nyquist)
             warn(f"dt={dt} is too large to capture frequencies produced by mode {mode_idx+1} "
                  f"({mode_freqs[mode_idx]:.4f} Hz) and beyond, per the Nyquist limit. Consider "
-                 f"reducing dt to {dt_max} or lower. If simulated activity will be temporally "
+                 f"reducing dt to {dt_max:.4f} or lower. If simulated activity will be temporally "
                  "smoothed and/or downsampled (e.g., by the Balloon-Windkessel model), this may "
                  "not be a concern.")
 
@@ -275,7 +276,7 @@ def balloon_model(
     emodes: NDArray[np.floating],
     method: _PDEKind = "fourier",
     mass: csc_matrix | None = None,
-    padding_tol: np.floating = 1e-5,
+    padding_tol: np.floating | Literal['nt'] = 1e-5,
     checks: _CheckKind = True,
     **params
 ) -> NDArray[np.floating]:
@@ -344,6 +345,8 @@ def balloon_model(
     for param_name, param_value in params.items():
         if not isinstance(param_value, (int, float)) or param_value <= 0:
             raise ValueError(f"Parameter '{param_name}' must be a positive number.")
+
+    # TODO: add Nyquist check
 
     # Eigendecompose activity to get modal coefficients over time
     # TODO: consider re-adding sim_nft_waves(..., return_bold=False) to avoid redundant
@@ -435,32 +438,7 @@ def _gen_noise(
     # This is achieved by f = mass^(-1/2) @ noise: f.T @ mass @ f = noise.T @ noise = 1
     # After incorporating the mass-weighting needed later for the weak form PDE, this becomes:
     # mass @ f = mass @ mass^(-1/2) @ noise = mass^(1/2) @ noise.
-    if mass.nnz == mass.shape[0]:
-        # Lumped mass is diagonal and thus easily sqrt'd
-        return noise * np.sqrt(mass.diagonal())[:, None]
-
-    # Consistent mass requires matrix factorisation
-    from scipy.sparse.csgraph import reverse_cuthill_mckee
-
-    # Manually permute rows/cols of mass to reduce its bandwidth and thus increase sparsity of L and
-    # U factors for efficiency. splu usually does this internally, but does not offer the option to
-    # ensure symmetric permutation, as is needed for L @ U = L @ D @ L.T (see below).
-    perm = reverse_cuthill_mckee(mass, symmetric_mode=True)
-    inv_perm = np.argsort(perm)
-    mass_perm = mass[perm, :][:, perm]
-
-    # Factorize mass = L @ U = L @ D @ L.T = (L @ D^(1/2)) @ (L @ D^(1/2)).T = mass^(1/2) @ mass^(1/2).T
-    # i.e., use splu but since mass is SPD we can get the Cholesky factorization without needing
-    # extra dependencies
-    lu = splu(mass_perm, permc_spec='NATURAL', diag_pivot_thresh=0)
-    L = lu.L.tocsr()
-    D = lu.U.diagonal()[:, None]
-
-    # Scale noise by mass^(1/2) = L @ D^(1/2)
-    noise_normed = L @ (np.sqrt(D) * noise)
-
-    # Reverse the permutation
-    return noise_normed[inv_perm]
+    return _mult_by_sqrtmass(noise, mass)
 
 def _model_wave_fourier(
     input_coeffs: NDArray[np.floating],
@@ -468,7 +446,7 @@ def _model_wave_fourier(
     r: float,
     gamma: float,
     evals: NDArray[np.floating],
-    padding_tol: float
+    padding_tol: float | Literal['nt']
 ) -> NDArray[np.floating]:
     """
     Simulates the time evolution of wave models for all modes using a frequency-domain approach.
@@ -523,8 +501,11 @@ def _model_wave_fourier(
     # This is required for the correct Green's function solution of the damped wave equation.
     # NFT transfer function has a temporal envelope of exp(-gamma * t), so we can pad until this is
     # below the padding tolerance.
-    t_pad = -np.log(padding_tol) / gamma
-    n_pad = int(np.ceil(t_pad / dt))
+    if padding_tol == 'nt':
+        n_pad = nt
+    else:
+        t_pad = -np.log(padding_tol) / gamma
+        n_pad = int(np.ceil(t_pad / dt))
     input_coeffs_padded = np.pad(input_coeffs, ((0, 0), (n_pad, 0)), constant_values=0)
 
     # Frequency-domain representation of the causal signal
@@ -623,7 +604,7 @@ def _model_wave_fem(
     dt: float,
     r: float,
     gamma: float,
-    padding_tol: float,
+    padding_tol: float | Literal['nt'],
     n_jobs: int,
     verbose: int # for Parallel only (consider making **Parallel_kwargs)
 ) -> NDArray[np.floating]:
@@ -663,8 +644,11 @@ def _model_wave_fem(
 
     # Pad input with zeros on negative side to ensure causality (system is only driven for t >= 0)
     # This is required for the correct Green's function solution of the damped wave equation.
-    t_pad = -np.log(padding_tol) / gamma
-    n_pad = int(np.ceil(t_pad / dt))
+    if padding_tol == 'nt':
+        n_pad = nt
+    else:
+        t_pad = -np.log(padding_tol) / gamma
+        n_pad = int(np.ceil(t_pad / dt))
     input_padded = np.pad(input_w, ((0, 0), (n_pad, 0)), constant_values=0)
 
     # Apply Fourier transform to get frequency-domain representation of the causal signal.
@@ -706,7 +690,7 @@ def _model_wave_fem(
 def _model_balloon_fourier(
     activity_coeffs: NDArray[np.floating],
     dt: float,
-    padding_tol: float,
+    padding_tol: float | Literal['nt'],
     kappa: float = 0.65,
     tau: float = 0.98,
     alpha: float = 0.32,
@@ -783,9 +767,12 @@ def _model_balloon_fourier(
     # Flow response transfer function (phi_hat_Fz) has a pole at s = -kappa/2
     # BOLD response transfer function (phi_hat_yF) has poles at s = -1/tau and s = -1/(alpha*tau)
     # Padding should compensate for the slowest-decaying of these poles, each given by e^(-s*t)
-    decay_eff = np.min((kappa / 2, 1 / tau, 1 / (alpha * tau)))
-    t_pad = -np.log(padding_tol) / decay_eff
-    n_pad = int(np.ceil(t_pad / dt))
+    if padding_tol == 'nt':
+        n_pad = nt
+    else:
+        decay_eff = np.min((kappa / 2, 1 / tau, 1 / (alpha * tau)))
+        t_pad = -np.log(padding_tol) / decay_eff
+        n_pad = int(np.ceil(t_pad / dt))
     activity_coeffs_padded = np.pad(activity_coeffs, ((0, 0), (n_pad, 0)), constant_values=0)
 
     # Calculate balloon model frequency response (Pang et al. 2016)

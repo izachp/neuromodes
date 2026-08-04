@@ -139,7 +139,6 @@ def test_gen_noise_covariance(solver):
     assert np.abs(cov_mean) < 0.35                # expected covariance is 0
     assert np.abs(var_mean - solver.n_verts) < 2  # expected variance is n_verts
 
-    # TODO: Consistent mass-normalised white noise
     noise = _gen_noise(solver.n_verts, nt, mass=solver.mass, seed=seed)
     # remove mass-weighting by solving mass * x = noise
     noise = splu(solver.mass).solve(noise)

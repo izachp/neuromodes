@@ -351,15 +351,21 @@ class EigenSolver(Solver):
             https://doi.org/10.64898/2026.01.22.701178
         """
         # Validate arguments
-        if decomp not in ['cholesky', 'lu']:
+        if decomp == 'cholesky':
+            if find_spec('cholespy') is None:
+                raise ImportError("cholespy is required for Cholesky decomposition. Neuromodes can "
+                                  "be installed with the 'cholesky' extra to include cholespy as a "
+                                  "dependency (e.g., pip install neuromodes[cholesky]).")
+            from cholespy import (  # pyright: ignore[reportMissingImports]
+                CholeskySolverD,
+                MatrixType,
+            )
+            from scipy.sparse.linalg import LinearOperator, eigsh
+            if sigma >= 0:
+                raise ValueError("sigma must be negative for Cholesky decomposition, as the shift "
+                                 "matrix (stiffness - sigma * mass) must be positive definite.")
+        elif decomp != 'lu':
             raise ValueError("decomp must be 'cholesky' or 'lu'.")
-        if decomp == 'cholesky' and find_spec('cholespy') is None:
-            raise ImportError("cholespy is required for Cholesky decomposition. Neuromodes can be "
-                              "installed with the 'cholesky' extra to include cholespy as a "
-                              "dependency (e.g., pip install neuromodes[cholesky]).")
-        if decomp == 'cholesky' and sigma >= 0:
-            raise ValueError("sigma must be negative for Cholesky decomposition, as the shift "
-                             "matrix (stiffness - sigma * mass) must be positive definite.")
         if n_modes != int(n_modes) or n_modes <= 0 or n_modes >= self.n_verts:
             raise ValueError("n_modes must be a positive integer less than the number of vertices"
                              f" ({self.n_verts}).")
@@ -373,11 +379,6 @@ class EigenSolver(Solver):
 
         # Solve the eigenvalue problem
         if decomp == 'cholesky':  # TODO: consider LaPy PR to make this a simple Solver.eigs() call
-
-            # NOTE: D is for double precision, as stiffness will always be float64. If we later
-            # support float32, we can import the F version instead.
-            from cholespy import CholeskySolverD, MatrixType
-            from scipy.sparse.linalg import LinearOperator, eigsh
 
             # Cholesky factorisation via shift-invert
             shiftmat = self.stiffness - sigma * self.mass

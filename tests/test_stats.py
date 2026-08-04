@@ -15,7 +15,6 @@ from neuromodes.stats import (
     parcellate,
     pdistw,
     sigmoid_rescale,
-    solvew,
     ssqw,
     stdw,
     varw,
@@ -158,18 +157,6 @@ class TestEye:
         lstsq_wn = lstsqw(X, Y, mass=noneye)[0]
         assert not np.allclose(lstsq_wn, lstsq_w), "Least squares with non-identity mass should " \
                                                    "not be the same as unweighted least squares."
-
-    def test_solvew_eye(self, random_data):
-        X, Y, eye, noneye = random_data
-
-        solve_w = solvew(X, Y, mass=eye)
-        solve_u = np.linalg.solve(X.T @ X, X.T @ Y)
-        assert np.allclose(solve_w, solve_u), "Solve with identity mass should be the same as " \
-                                              "unweighted solve."
-        
-        solve_wn = solvew(X, Y, mass=noneye)
-        assert not np.allclose(solve_wn, solve_w), "Solve with non-identity mass should not be " \
-                                                   "the same as unweighted solve."
         
     def test_cdistw_eye(self, random_data):
         X, Y, eye, noneye = random_data
@@ -282,16 +269,12 @@ class Test1D:
         lstsq_w = lstsqw(x_1d[:, np.newaxis], y_1d[:, np.newaxis], mass=eye)[0]
         lstsq_u = np.linalg.lstsq(x_1d[:, np.newaxis], y_1d[:, np.newaxis], rcond=None)[0]
         assert np.allclose(lstsq_w, lstsq_u), "Lstsqw with 1D input should match unweighted lstsq."
-    
-    def test_solvew_1d(self, random_data):
-        X, Y, eye, _ = random_data
-        x_1d = X[:, 0]
-        y_1d = Y[:, 0]
-        # solvew expects 2D, so reshape 1D to (n, 1)
-        solve_w = solvew(x_1d[:, np.newaxis], y_1d[:, np.newaxis], mass=eye)
-        solve_u = np.linalg.solve(x_1d[:, np.newaxis].T @ x_1d[:, np.newaxis], 
-                                  x_1d[:, np.newaxis].T @ y_1d[:, np.newaxis])
-        assert np.allclose(solve_w, solve_u), "Solvew with 1D input should match unweighted solve."
+
+    # TODO: add test to check that lstsqw output for consistent mass matches np.linalg.solve(a.T @
+    # mass @ a, a.T @ mass @ b)
+
+    # TODO: add test to check that lstsq output is different for lumped vs consistent mass and
+    # matches some expectation?
     
     def test_cdistw_1d(self, random_data):
         X, Y, eye, _ = random_data
