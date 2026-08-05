@@ -179,14 +179,7 @@ def eigenstrap(
           <https://neuromodes.readthedocs.io/en/latest/validation/nulls_eigenstrap_speed.html>`__
           for more comparisons between the ``'scipy'`` and ``'qr'`` methods.
 
-       c. Lack of cholmod. The original implementation uses ``cholmod`` for fast sparse matrix
-          operations when computing the original calculation of geometric eigenmodes. In contrast,
-          in order to simplify installation, this implementation does not use ``cholmod``. This has
-          some impacts on how quickly modes can be computed. However, as they can be computed once
-          and then saved, we hope that this will not be a major issue for users (we welcome
-          contributions to add support for this!).
-
-       d. Lack of parallelization from ``joblib``. The original implementation uses ``joblib`` to
+       c. Lack of parallelization from ``joblib``. The original implementation uses ``joblib`` to
           parallelize the generation of nulls across multiple CPU cores. Given our generation of
           nulls is faster, we have not implemented that at this stage. We welcome contributions to
           add support for this, but note that it may be difficult to implement this in a way that is
@@ -194,7 +187,7 @@ def eigenstrap(
           the original implementation is not reproducible when using ``joblib`` due to the order in
           which the seeds are generated/used.
 
-       e. Only match default. We are able to exactly match the default functionality of the original
+       d. Only match default. We are able to exactly match the default functionality of the original
           implementation, but not all possible configurations. This is because of some changes we
           have made to increase speed, account for mesh irregularity, and facilitate
           reproducibility. In particular, when ``randomize=False`` and ``residual=None``, the output
@@ -204,7 +197,7 @@ def eigenstrap(
           between the two implementations. This is because of changes we have made to increase
           speed and account for mesh irregularity.
 
-       f. Changes to RNG. Here, we have changed to ``numpy``'s newer ``Generator`` for random number
+       e. Changes to RNG. Here, we have changed to ``numpy``'s newer ``Generator`` for random number
           generation, which means that the global seed does not affect the output of the function
           when using ``rotation_method='qr'``. This is in contrast to the original implementation,
           which used the legacy ``RandomState`` approach. See the last paragraph in the `'Quick
@@ -214,7 +207,7 @@ def eigenstrap(
           the global seed when using ``seed=None``; this is preserved in ``rotation_method='scipy'``
           for compatibility, but not in ``rotation_method='qr'``.
 
-       g. Use of first mode: This function uses the constant mode (first column of ``emodes``) and
+       f. Use of first mode: This function uses the constant mode (first column of ``emodes``) and
           its corresponding eigenvalue. In contrast, the original implementation excludes the
           constant mode and its eigenvalue. Whereas in the original  implementation users were
           expected to input ``emodes`` and ``evals`` with the constant mode/eigenvalue removed
@@ -223,11 +216,11 @@ def eigenstrap(
           the advantage of preserving the original (mass-weighted) mean of the data without need for
           resampling.
 
-       h. Concurrent processing of multiple maps. This function can process multiple maps at the
+       g. Concurrent processing of multiple maps. This function can process multiple maps at the
           same time. This was possible in the original implementation, but required users to save
           rotation matrices and reapply them to all maps.
 
-       i. Resample AND add residuals: If both resampling and adding residuals is requested, the
+       h. Resample AND add residuals: If both resampling and adding residuals is requested, the
           original implementation adds residuals after resampling. Here, the order of these steps is
           swapped (i.e., add residuals and then resample). This ensures that the resampling remains
           intact (e.g., that the surrogates and original actually have the same values). If
@@ -235,12 +228,12 @@ def eigenstrap(
           remain intact. This difference is only relevant if both ``resample`` and ``residual`` are
           used.
 
-       j. Mass-weighted decomposition and statistics. To account for mesh irregularity, the mass
+       i. Mass-weighted decomposition and statistics. To account for mesh irregularity, the mass
           matrix is used when decomposing input maps into modal coefficients. In contrast, the
           original implementation performs ordinary least-squares regression. Additionally,
           mass-weighted means and standard deviations are used for ``resample='affine'``.
 
-       k. Syntax for exact replication. To exactly match the default version of the original
+       j. Syntax for exact replication. To exactly match the default version of the original
           implementation of eigenstrapping in ref [1]_, users specify the following input parameters
           to this function:
 
