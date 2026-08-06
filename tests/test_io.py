@@ -21,13 +21,13 @@ from neuromodes.mesh import check_surf, check_vol, is_vol
 def test_fetch_example_surf():
     for hemi in ['L', 'R']:
         for species in ['human', 'macaque', 'marmoset']:
-            for density in ['4k', '32k']:
-                if species != 'human' and density == '4k':
+            for res in ['4k', '32k']:
+                if species != 'human' and res == '4k':
                     with raises(FileNotFoundError, match="Surface data .* not found"):
-                        fetch_example_surf(species=species, hemi=hemi, density=density)
+                        fetch_example_surf(species=species, hemi=hemi, res=res)
                     continue
 
-                surf, medmask = fetch_example_surf(species=species, hemi=hemi, density=density)
+                surf, medmask = fetch_example_surf(species=species, hemi=hemi, res=res)
                 assert surf.v.shape[0] > 0
                 assert surf.v.shape[1] == 3
                 assert surf.t.shape[0] > 0
@@ -39,7 +39,7 @@ def test_fetch_example_surf():
 
 def test_fetch_invalid_surf():
     with raises(FileNotFoundError, match="Surface data .* not found"):
-        fetch_example_surf(surf_type='makessense')
+        fetch_example_surf(structure='makessense')
 
 def test_fetch_gradient():
     grad = fetch_example_map('fcgradient1')
@@ -93,7 +93,8 @@ def test_fetch_vol():
             vol = fetch_example_vol(structure=structure, hemi=hemi)
             check_vol(vol)  # Should not raise
         
-        mus = fetch_example_vol('cortex', species='mouse', template='AMBA')
+        mus = fetch_example_vol('isocortex', species='mouse', template='AMBA', res='200um',
+                                hemi=hemi)
         check_vol(mus)
 
 def test_fetch_invalid_vol():
@@ -127,7 +128,7 @@ def test_read_vol_dict():
     assert vol.t.shape == (3, 4)
 
 def test_read_vol_vtk():
-    filename = 'sp-human_tpl-MNI152_hemi-L_thalamus.tetra.vtk'
+    filename = 'sp-human_tpl-MNI152_res-2mm_hemi-L_thalamus.tetra.vtk'
     vtk_vol = read_vol(Path(__file__).parent.parent / 'neuromodes' / 'data' / filename)
 
     assert isinstance(vtk_vol, TetMesh)

@@ -12,9 +12,10 @@ from neuromodes.stats import sigmoid_rescale, zscorew
 
 def test_vol_modes():
     for hemi in ['L', 'R']:
-        for structure in ['thalamus', 'hippocampus', 'striatum', 'cortex']:
-            if structure == 'cortex':
-                vol = fetch_example_vol(structure=structure, species='mouse', template='AMBA', hemi=hemi)
+        for structure in ['thalamus', 'hippocampus', 'striatum', 'isocortex']:
+            if structure == 'isocortex':
+                vol = fetch_example_vol(structure=structure, species='mouse', template='AMBA',
+                                        res='200um', hemi=hemi)
             else:
                 vol = fetch_example_vol(structure=structure, hemi=hemi)
 
@@ -32,12 +33,12 @@ def test_vol_modes():
 
 @pytest.fixture(scope="module")
 def surf_medmask():
-    return fetch_example_surf(density='4k')
+    return fetch_example_surf(res='4k')
 
 @pytest.fixture(scope="module")
 def presolver(surf_medmask):
     surf, medmask = surf_medmask
-    myelinmap = fetch_example_map(data="myelinmap", density="4k")[medmask]
+    myelinmap = fetch_example_map(data="myelinmap", res="4k")[medmask]
     solver = EigenSolver(surf, mask=medmask) # TODO: just use surf_medmask?
     hetero = sigmoid_rescale(zscorew(myelinmap, solver.mass), steepness=0.5, upper=2.0)
     return solver.compute_lbo(hetero=hetero)
@@ -100,7 +101,7 @@ def test_hetero_ones(surf_medmask):
             f'Eigenmode {i+1} with hetero=ones does not match its homogeneous equivalent.'
 
 def test_real_heteromaps():
-    mesh, medmask = fetch_example_surf() # 32k density to match included maps
+    mesh, medmask = fetch_example_surf() # 32k to match included maps
     solver = EigenSolver(mesh, mask=medmask)
 
     map_names = ['fcgradient1', 'myelinmap', 'ndi', 'odi', 'thickness']

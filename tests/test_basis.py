@@ -10,7 +10,7 @@ from neuromodes.stats import sigmoid_rescale, zscorew
 
 @pytest.fixture(scope='module')
 def solver():
-    surf, medmask = fetch_example_surf(density='4k')
+    surf, medmask = fetch_example_surf(res='4k')
     randmap = np.random.default_rng(0).standard_normal(size=medmask.sum())
     solver = EigenSolver(surf, mask=medmask)
     hetero = sigmoid_rescale(zscorew(randmap, solver.mass), steepness=0.5, upper=2.0)

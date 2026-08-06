@@ -1,7 +1,7 @@
 """
-Mass (or simply area)-weighted adaptations of common statistical functions for spatial maps.
-Conventional functions are equivalent to setting mass to identity, representing a mesh where each
-vertex has Voronoi area/volume of 1.
+Mass (or simply vertex area/volume)-weighted adaptations of common statistical functions for spatial
+maps. Conventional functions are equivalent to setting mass to identity, representing a mesh where
+each vertex has Voronoi area/volume of 1.
 """
 
 from __future__ import annotations
