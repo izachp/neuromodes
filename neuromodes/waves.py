@@ -198,7 +198,8 @@ def sim_nft_waves(
                  "plausible wave speeds, or adjust speed_limits.")
     if method not in ['fourier', 'ode', 'fem']:
         raise ValueError(f"Invalid PDE method '{method}'; must be 'fourier', 'ode', or 'fem'.")
-    if (padding_tol <= 0 or padding_tol > 1) and padding_tol != 'nt':
+    if padding_tol != 'nt' and (not isinstance(padding_tol, (int, float))
+                                or padding_tol <= 0 or padding_tol > 1):
         raise ValueError("padding_tol must be between 0 and 1, or 'nt'.")
     if n_jobs != 1:
         if method != 'fem':
