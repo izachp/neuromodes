@@ -724,8 +724,11 @@ def _mult_by_sqrtmass(
     Multiplies the input data by the square root of the mass matrix. If the mass matrix is diagonal
     (i.e., lumped mass), this is equivalent to multiplying each vertex by the square root of its
     corresponding area. If the mass matrix is not diagonal (i.e., consistent mass), this function
-    computes the square root of the mass matrix using a sparse LU decomposition and applies it to
-    the input data.
+    computes the square root of the mass matrix as a Cholesky factor and applies it to the input
+    data. Note that the square root of consistent mass is not unique, so the factorization choice
+    will affect the result. However, quadratic forms such as ``x.T @ mass @ x`` are invariant to the
+    choice of square root, making this function suitable for use in :func:`lstsqw` and
+    :func:`~neuromodes.waves._gen_noise`.
 
     Parameters
     ----------
@@ -744,7 +747,7 @@ def _mult_by_sqrtmass(
     data, mass = ved.data, ved.mass
 
     if mass.nnz == mass.shape[0]:
-        # Lumped mass is diagonal and thus easily sqrt'd
+        # Lumped mass is diagonal and thus easily/uniquely sqrt'd
         return data * np.sqrt(mass.diagonal())[:, None]
 
     # Consistent mass requires matrix factorisation
@@ -756,15 +759,15 @@ def _mult_by_sqrtmass(
     inv_perm = np.argsort(perm)
     mass_perm = mass[perm, :][:, perm]
 
-    # Factorize mass = L @ U = L @ D @ L.T = (L @ D^(1/2)) @ (L @ D^(1/2)).T = mass^(1/2) @ mass^(1/2).T
+    # Factorize mass = L @ U = L @ D @ L.T = (L @ D^(1/2)) @ (L @ D^(1/2)).T = L_chol @ L_chol.T
     # i.e., use splu but since mass is SPD we can get the Cholesky factorization without needing
     # extra dependencies
     lu = splu(mass_perm, permc_spec='NATURAL', diag_pivot_thresh=0)
     L = lu.L.tocsr()
     D = lu.U.diagonal()[:, None]
 
-    # Scale data by mass^(1/2) = L @ D^(1/2)
-    data_rescaled = L @ (np.sqrt(D) * data)
+    # Scale permuted data by L_chol = L @ D^(1/2)
+    data_rescaled = L @ (np.sqrt(D) * data[perm, :])
 
     # Reverse the permutation
     return data_rescaled[inv_perm]
