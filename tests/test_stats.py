@@ -393,3 +393,6 @@ class TestParcellate:
     # TODO: add something similar to MGH's example where a simple function is irregularly sampled
     # but accounted for by the mass matrix, and check that parcellation recovers the expected values
     # in each parcel.
+
+# TODO: test _mult_by_cholesky by checking that mass = L @ L.T @ I
+# TODO: test lstsqw with consistent mass by checking that it solves the normal equations: a.T @ mass @ a @ x = a.T @ mass @ b

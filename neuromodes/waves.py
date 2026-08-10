@@ -16,7 +16,7 @@ from scipy.sparse.linalg import splu
 
 from neuromodes.basis import decompose
 from neuromodes.eigen import EigenData
-from neuromodes.stats import _mult_by_sqrtmass
+from neuromodes.stats import _mult_by_cholesky
 
 if TYPE_CHECKING:
     from typing import Literal
@@ -404,7 +404,9 @@ def _gen_noise(
     """
     Generate reproducible white noise of shape ``(n_samples, nt)`` for a given ``seed``, derived
     from a standard normal distribution. The output is reproducible across nt (i.e.,
-    ``_gen_noise(n_samples, nt, seed) == _gen_noise(n_samples, nt+k, seed)[:, :nt]``).
+    ``_gen_noise(n_samples, nt, seed) == _gen_noise(n_samples, nt+k, seed)[:, :nt]``). If ``mass``
+    is provided, the noise is pre-weighted by the mass matrix for use in the weak form PDE of the
+    FEM solver (see Notes).
 
     Parameters
     ----------
@@ -424,6 +426,38 @@ def _gen_noise(
     -------
     np.ndarray
         Gaussian white noise array of shape ``(n_samples, nt)``.
+
+    Notes
+    -----
+    By sampling each element of the noise array (F) from the standard normal distribution, the
+    expected Gram matrix becomes:
+    
+    E(F[:,t0].T F[:,t1]) = 0 ∀ t0 ≠ t1  (temporal independence),
+    E(F[:,t0].T F[:,t0]) = E(sum_k^n_samples F[k,t0]^2)
+                         = sum_k^n_samples E(F[k,t0]^2)
+                         = sum_k^n_samples 1  (unit variance)
+                         = n_samples
+    ∴ E(F^T F) = n_samples I
+
+    For noise in vertex space, we must correct each map (column) to account for mass-weighting in
+    the Gram matrix. This is achieved by leveraging the Cholesky decomposition of the symmetric
+    positive definite mass matrix: M = L L^T, where L is lower triangular. By defining the
+    mass-normalized noise as W = L^(-T) F, the expected Gram matrix is preserved:
+    
+    E(W^T M W) = E((L^(-T) F)^T (L L^T) (L^(-T) F))
+               = E(F^T L^(-1) L L^T L^(-T) F)
+               = E(F^T F)
+               = n_samples I
+    
+    However, since the weak form PDE of the NFT wave model's FEM solver needs mass-weighting, we can
+    pre-factor this into our noise generation:
+    
+    M W = M L^(-T) F
+        = L L^T L^(-T) F
+        = L F.
+
+    This lets us use a simple sparse multiplication instead of the slower and less numerically
+    stable ``scipy.sparse.linalg.spsolve_triangular(L.T, noise)``.
     """
 
     # Draw samples from N(0, 1) in column-major order to ensure reproducibility across nt, then
@@ -431,15 +465,11 @@ def _gen_noise(
     rng = np.random.default_rng(seed)
     noise = rng.standard_normal((nt, n_samples)).T
 
-    if mass is None:  # modes along rows
+    if mass is None:  # e.g., modes along rows
         return noise
-    
-    # For vertex space, we first mass-normalise the noise map to ensure that its mass-weighted
-    # variance has an expected value of 1.
-    # This is achieved by f = mass^(-1/2) @ noise: f.T @ mass @ f = noise.T @ noise = 1
-    # After incorporating the mass-weighting needed later for the weak form PDE, this becomes:
-    # mass @ f = mass @ mass^(-1/2) @ noise = mass^(1/2) @ noise.
-    return _mult_by_sqrtmass(noise, mass)
+
+    # vertex space, pre-weighted by L^T Cholesky factor
+    return _mult_by_cholesky(noise, mass, transpose=False)
 
 def _model_wave_fourier(
     input_coeffs: NDArray[np.floating],

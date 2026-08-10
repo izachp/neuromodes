@@ -493,7 +493,7 @@ def lstsqw(
 ) -> tuple[NDArray[np.floating], int, float, NDArray[np.floating]]:
     """
     Solve the linear system Ax = b, where A and b are sets of spatial maps, by minimising the
-    mass-weighted L2 norm ``(b-Ax).T @ mass @ (b-Ax)``.
+    mass-weighted (squared) L2 norm (b-Ax)^T M (b-Ax) (see Notes).
 
     Parameters
     ----------
@@ -514,26 +514,39 @@ def lstsqw(
     np.ndarray
         Least-squares solution. Shape is ``(n_maps_a, n_maps_b)`` if ``data_b`` is 2D, or
         ``(n_maps_a,)`` if ``data_b`` is 1D.
+
+    Notes
+    -----
+    For discretized spatial maps, we want to minimize the mass-weighted L2 norm. By leveraging the
+    Cholesky decomposition of the symmetric positive definite mass matrix (M = L L^T), we can
+    transform the mass-weighted norm into a typical Euclidean norm:
+    
+    || b - A x ||_(2,mass)^2 = (b - A x)^T M (b - A x)
+                             = (b - A x)^T L L^T (b - A x)
+                             = (L^T(b - A x))^T (L^T(b - A x))
+                             = ((L^T b) - (L^T A) x)^T ((L^T b) - (L^T A) x)
+                             = || (L^T b) - (L^T A) x ||_(2,Euclidean)^2
+    
+    The above tells us that we can still use a standard least squares solver if we simply scale the
+    data by L^T. This is equivalent to using np.linalg.solve(a.T @ mass @ a, a.T @ mass @ b) but is
+    more efficient and numerically stable.
     """
     ved = EigenData(data=(data_a, data_b), mass=mass)
     a, b = ved.data
 
-    # For discretised spatial maps, we want to minimise the mass-weighted L2 norm (variance):
-    # (b-Ax)^T M (b-Ax) = (b-Ax)^T sqrt(M)^T sqrt(M) (b-Ax)
-    #                   = (sqrt(M)b-sqrt(M)Ax)^T (sqrt(M)b-sqrt(M)Ax)
-    # The above is now a Euclidean L2 norm, which tells us that we can still use a standard lstsq
-    # solver if we simply rescale A and b by sqrt(M) first
-
-    # concatenate both data arrays for efficient rescaling
+    # concatenate both data arrays for efficient Cholesky multiplication
     if a.ndim == 1:
         a = a[:, None]
     if b.ndim == 1:
         b = b[:, None]
     ab = np.concatenate([a, b], axis=1)
-    sqrtmass_ab = _mult_by_sqrtmass(ab, mass)
+
+    # multiply and unpack
+    sqrtmass_ab = _mult_by_cholesky(ab, mass, transpose=True)
     sqrtmass_a = sqrtmass_ab[:, :a.shape[1]]
     sqrtmass_b = sqrtmass_ab[:, a.shape[1]:]
 
+    # Get results from standard least squares solver
     return np.linalg.lstsq(sqrtmass_a, sqrtmass_b, rcond=rcond)
 
 def parcellate(
@@ -716,58 +729,69 @@ def _process_vertex_areas(
 
     return output
 
-def _mult_by_sqrtmass(
+def _mult_by_cholesky(
     data: NDArray[np.floating],
-    mass: spmatrix | NDArray[np.floating]
+    matrix: spmatrix | NDArray[np.floating],
+    transpose: bool = False
 ) -> NDArray[np.floating]:
     """
-    Multiplies the input data by the square root of the mass matrix. If the mass matrix is diagonal
-    (i.e., lumped mass), this is equivalent to multiplying each vertex by the square root of its
-    corresponding area. If the mass matrix is not diagonal (i.e., consistent mass), this function
-    computes the square root of the mass matrix as a Cholesky factor and applies it to the input
-    data. Note that the square root of consistent mass is not unique, so the factorization choice
-    will affect the result. However, quadratic forms such as ``x.T @ mass @ x`` are invariant to the
-    choice of square root, making this function suitable for use in :func:`lstsqw` and
-    :func:`~neuromodes.waves._gen_noise`.
+    Multiplies the input data by the Cholesky factor ``L`` (or its transpose ``L.T``) of the given
+    matrix (i.e., ``matrix`` = ``L @ L.T``). If the matrix is diagonal, ``L`` = ``L.T`` =
+    ``√(matrix)``. Note that ``matrix`` must be symmetric positive definite for the Cholesky
+    factorization to exist.
 
     Parameters
     ----------
     data : array-like
         The spatial maps, of shape ``(n_verts, n_maps)``.
-    mass : array-like
-        The mass matrix, of shape ``(n_verts, n_verts)``.
+    matrix : array-like
+        The matrix to multiply the data by, of shape ``(n_verts, n_verts)``.
+    transpose : bool, optional
+        If True, multiplies by ``L.T`` instead of ``L``. Default is ``False``.
 
     Returns
     -------
     np.ndarray
-        The input data multiplied by the square root of the mass matrix, of shape ``(n_verts,
+        The input data multiplied by the Cholesky factor of the matrix, of shape ``(n_verts,
         n_maps)``.
     """
-    ved = EigenData(data=data, mass=mass)
-    data, mass = ved.data, ved.mass
+    ved = EigenData(data=data, mass=matrix)  # a bit dodgy
+    data, matrix = ved.data, ved.mass
 
-    if mass.nnz == mass.shape[0]:
-        # Lumped mass is diagonal and thus easily/uniquely sqrt'd
-        return data * np.sqrt(mass.diagonal())[:, None]
+    # check symmetry of matrix
+    if (matrix != matrix.T).nnz > 0:
+        raise ValueError("matrix is not symmetric.")
 
-    # Consistent mass requires matrix factorisation
+    if matrix.nnz == matrix.shape[0]:
+        # Diagonal matrix; L = L^T = √(matrix)
+        return data * np.sqrt(matrix.diagonal())[:, None]
 
-    # Manually permute rows/cols of mass to reduce its bandwidth and thus increase sparsity of L and
-    # U factors for efficiency. splu usually does this internally, but does not offer the option to
-    # ensure symmetric permutation, as is needed for L @ U = L @ D @ L.T (see below).
-    perm = reverse_cuthill_mckee(mass, symmetric_mode=True)
-    inv_perm = np.argsort(perm)
-    mass_perm = mass[perm, :][:, perm]
+    # Non-diagonal matrix; compute Cholesky factorization via LU decomposition.
 
-    # Factorize mass = L @ U = L @ D @ L.T = (L @ D^(1/2)) @ (L @ D^(1/2)).T = L_chol @ L_chol.T
-    # i.e., use splu but since mass is SPD we can get the Cholesky factorization without needing
-    # extra dependencies
-    lu = splu(mass_perm, permc_spec='NATURAL', diag_pivot_thresh=0)
-    L = lu.L.tocsr()
+    # Manually permute rows/cols of matrix to reduce its bandwidth and thus increase sparsity of L
+    # and U factors for efficiency. splu usually does this internally, but does not offer the option
+    # to ensure symmetric permutation, as is needed for L_lu U = L_lu D L_lu^T (see below).
+    perm = reverse_cuthill_mckee(matrix, symmetric_mode=True)
+    matrix_perm = matrix[perm, :][:, perm]
+
+    # Factorize, while forcing splu to avoid permuting and pivoting
+    # matrix = L_lu U = L_lu D L_lu^T = (L_lu √(D)) (L_lu √(D))^T = L L^T
+    lu = splu(matrix_perm, permc_spec='NATURAL', diag_pivot_thresh=0)
+    L_lu = lu.L.tocsr()
     D = lu.U.diagonal()[:, None]
 
-    # Scale permuted data by L_chol = L @ D^(1/2)
-    data_rescaled = L @ (np.sqrt(D) * data[perm, :])
+    # Check that matrix is SPD (D must be positive)
+    if np.any(D <= 0):
+        raise ValueError("matrix is not positive definite.")
+
+    # Scale permuted data
+    if transpose:
+        # L.T = (L_lu √(D))^T = √(D) L_lu^T
+        data_rescaled = np.sqrt(D) * (L_lu.T @ data[perm, :])
+    else:
+        # L = L_lu √(D)
+        data_rescaled = L_lu @ (np.sqrt(D) * data[perm, :])
 
     # Reverse the permutation
-    return data_rescaled[inv_perm]
+    inv_perm = np.argsort(perm)
+    return data_rescaled[inv_perm, :]

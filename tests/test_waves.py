@@ -8,7 +8,7 @@ from scipy.sparse.linalg import splu
 
 from neuromodes import EigenSolver
 from neuromodes.io import fetch_example_map, fetch_example_surf
-from neuromodes.stats import cdistw, sigmoid_rescale, zscorew
+from neuromodes.stats import cdistw, gramw, sigmoid_rescale, zscorew
 from neuromodes.waves import _gen_noise, calc_nft_fc, calc_wave_speed, sim_nft_waves
 
 
@@ -116,38 +116,40 @@ def test_gen_noise_reproducibility():
     assert (noise1 == noise2[:, :10]).all(), \
         "Noise generated with the same seed does not match across different nt."
 
-def test_gen_noise_covariance(solver):
+def test_gen_noise_gram(solver):
     seed = 0
     nt = 500
+    triu = np.triu_indices(nt, k=1)
 
     # Modal white noise
     noise = solver.emodes @ _gen_noise(solver.n_modes, nt, seed=seed)
-    cov_mat = noise.T @ solver.mass @ noise  # shape (nt, nt)
-    cov_mean = cov_mat[np.triu_indices_from(cov_mat, k=1)].mean()
-    var_mean = np.diag(cov_mat).mean()
-    assert np.abs(cov_mean) < 0.05                # expected covariance is 0
-    assert np.abs(var_mean - solver.n_modes) < 1  # expected variance is n_modes
+    gram = gramw(noise, mass=solver.mass)  # shape (nt, nt)
+
+    offdiag_mean = gram[triu].mean()  # expected to be 0
+    diag_mean = np.diag(gram).mean()  # expected to be n_samples = n_modes
+    assert np.abs(offdiag_mean) < 0.05     
+    assert np.abs(diag_mean - solver.n_modes) < 1
 
     # Lumped mass-normalised white noise
     mass_lumped = EigenSolver(solver.geometry).compute_lbo(lump=True).mass
     # remove mass-weighting by taking inverse mass as reciprocal of diagonal
     mass_inv = 1/mass_lumped.diagonal()[:, None]
     noise = mass_inv * _gen_noise(solver.n_verts, nt, mass=mass_lumped, seed=seed)  
-    cov_mat = noise.T @ mass_lumped @ noise
-    cov_mean = cov_mat[np.triu_indices_from(cov_mat, k=1)].mean()
-    var_mean = np.diag(cov_mat).mean()
-    assert np.abs(cov_mean) < 0.35                # expected covariance is 0
-    assert np.abs(var_mean - solver.n_verts) < 2  # expected variance is n_verts
+    gram = gramw(noise, mass=mass_lumped)  # shape (nt, nt)
+
+    offdiag_mean = gram[triu].mean()  # expected to be 0
+    diag_mean = np.diag(gram).mean()  # expected to be n_samples = n_verts
+    assert np.abs(offdiag_mean) < 0.35
+    assert np.abs(diag_mean - solver.n_verts) < 2
 
     noise = _gen_noise(solver.n_verts, nt, mass=solver.mass, seed=seed)
     # remove mass-weighting by solving mass * x = noise
     noise = splu(solver.mass).solve(noise)
-    cov_mat = noise.T @ solver.mass @ noise
-    cov_mean = cov_mat[np.triu_indices_from(cov_mat, k=1)].mean()
-    var_mean = np.diag(cov_mat).mean()
-    assert np.abs(cov_mean) < 0.35                # expected covariance is 0
-    assert np.abs(var_mean - solver.n_verts) < 2  # expected variance is n_verts
-
+    cov_mat = gramw(noise, mass=solver.mass)  # shape (nt, nt)
+    cov_mean = cov_mat[triu].mean()  # expected to be 0  
+    var_mean = np.diag(cov_mat).mean()  # expected to be n_samples = n_verts
+    assert np.abs(cov_mean) < 0.35
+    assert np.abs(var_mean - solver.n_verts) < 2
 
 def test_sim_nft_waves_reproducibility_fourier(solver):
     
