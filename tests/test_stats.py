@@ -4,7 +4,10 @@ from scipy import sparse
 from scipy.spatial.distance import cdist, pdist
 from scipy.stats import zscore
 
+from neuromodes import EigenSolver
+from neuromodes.io import fetch_example_surf
 from neuromodes.stats import (
+    _mult_by_cholesky,
     cdistw,
     covw,
     demeanw,
@@ -35,7 +38,6 @@ def random_data():
 
     eye = sparse.eye(n_verts)  # identity mass for testing
     noneye = sparse.diags(np.arange(1, n_verts + 1), dtype=np.float64)
-
     return X, Y, eye, noneye
 
 class TestEye:
@@ -394,5 +396,70 @@ class TestParcellate:
     # but accounted for by the mass matrix, and check that parcellation recovers the expected values
     # in each parcel.
 
-# TODO: test _mult_by_cholesky by checking that mass = L @ L.T @ I
-# TODO: test lstsqw with consistent mass by checking that it solves the normal equations: a.T @ mass @ a @ x = a.T @ mass @ b
+@pytest.fixture(scope='module')
+def solver():
+    surf, medmask = fetch_example_surf(density='4k')
+    return EigenSolver(surf, medmask)
+
+def test_mult_by_cholesky(solver):
+    n_maps = 3
+
+    # generate random maps
+    maps = np.random.default_rng(0).standard_normal(size=(solver.n_verts, n_maps))
+
+    # mass-weight maps
+    maps_M = solver.mass @ maps
+
+    # mass-weight maps via Cholesky
+    maps_LT = _mult_by_cholesky(maps, solver.mass, transpose=True)
+    maps_LLT = _mult_by_cholesky(maps_LT, solver.mass, transpose=False)
+
+    assert np.allclose(maps_LLT, maps_M, atol=1e-20), \
+        "Mult by Cholesky should satisfy L @ L.T @ maps = mass @ maps"
+
+    # verify that consistent mass != L^T L
+    maps_L = _mult_by_cholesky(maps, solver.mass, transpose=False)
+    maps_LTL = _mult_by_cholesky(maps_L, solver.mass, transpose=True)
+
+    assert not np.allclose(maps_LTL, maps_M, atol=1e-3), \
+        "Mult by Cholesky should not satisfy L.T @ L @ maps = mass @ maps for consistent mass"
+
+    # use lumped mass
+    solver.compute_lbo(lump=True)
+    maps_M_l = solver.mass @ maps
+    maps_LTL_l = _mult_by_cholesky(
+        _mult_by_cholesky(maps, solver.mass, transpose=False),
+        solver.mass,
+        transpose=True
+        )
+
+    # verify that lumped mass = L^T L = L L^T
+    assert np.allclose(maps_LTL_l, maps_M_l, atol=1e-20), \
+        "Mult by Cholesky should satisfy L.T @ L @ maps = mass @ maps for lumped mass"
+
+def test_lstsqw_consistent_mass(solver):
+    n_maps = 3
+    # ensure that the solver has consistent mass
+    solver.compute_lbo(lump=False)
+
+    # generate random maps
+    maps = np.random.default_rng(0).standard_normal(size=(solver.n_verts, n_maps))
+
+    # generate random target maps
+    targets = np.random.default_rng(1).standard_normal(size=(solver.n_verts, n_maps))
+
+    # solve least squares with consistent mass
+    coeffs = lstsqw(maps, targets, mass=solver.mass)[0]
+
+    # check that it solves the normal equations: a.T @ mass @ a @ x = a.T @ mass @ b
+    lhs = maps.T @ solver.mass @ maps @ coeffs
+    rhs = maps.T @ solver.mass @ targets
+
+    assert np.allclose(lhs, rhs, atol=1e-20), \
+        "Lstsqw with consistent mass should solve the normal equations: a.T @ mass @ a @ x = a.T @ mass @ b"
+
+    # check that coeffs differs when mass is lumped
+    solver.compute_lbo(lump=True)
+    coeffs_lumped = lstsqw(maps, targets, mass=solver.mass)[0]
+    assert not np.allclose(coeffs, coeffs_lumped, atol=1e-3), \
+        "Lstsqw with lumped mass should produce different coefficients than consistent mass."
