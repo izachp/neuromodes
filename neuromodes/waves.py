@@ -548,6 +548,7 @@ def _model_wave_fourier(
     input_coeffs_f = np.fft.rfft(input_coeffs_padded, axis=1)
 
     # Frequencies for full signal
+    # Negative sign in front of omega matches the physics convention of e^(iwt)
     omega = -2 * np.pi * np.fft.rfftfreq(n_pad + nt, d=dt) # keep consistent with _model_balloon_fourier
 
     # Compute transfer function and apply it to frequency-domain input
@@ -691,6 +692,7 @@ def _model_wave_fem(
 
     # Compute components of NFT operator
     spatial = r**2 * stiffness
+    # Negative sign in front of omega matches the physics convention of e^(iwt)
     omega = -2 * np.pi * np.fft.rfftfreq(nt+n_pad, dt)
     temporal = -omega**2 / gamma**2 - 2j * omega / gamma + 1
 
@@ -801,7 +803,7 @@ def _model_balloon_fourier(
     # Identify poles of transfer function by finding roots of its denominator
     # Flow response transfer function (phi_hat_Fz) has a pole at s = -kappa/2
     # BOLD response transfer function (phi_hat_yF) has poles at s = -1/tau and s = -1/(alpha*tau)
-    # Padding should compensate for the slowest-decaying of these poles, each given by e^(-s*t)
+    # Padding should compensate for the slowest-decaying of these poles, each given by e^(s*t)
     if padding_tol == 'nt':
         n_pad = nt
     else:
@@ -811,6 +813,7 @@ def _model_balloon_fourier(
     activity_coeffs_padded = np.pad(activity_coeffs, ((0, 0), (n_pad, 0)), constant_values=0)
 
     # Calculate balloon model frequency response (Pang et al. 2016)
+    # Negative sign in front of omega matches the physics convention of e^(iwt)
     omega = -2 * np.pi * np.fft.rfftfreq(nt+n_pad, d=dt)
     beta = (rho + (1 - rho) * np.log(1 - rho)) / rho
     phi_hat_Fz = 1 / (-(omega + 1j * 0.5 * kappa) ** 2 + w_f ** 2)
