@@ -54,7 +54,6 @@ def gramw(
         b = a
     return a.T @ (mass @ b)
 
-# TODO: ensure that all functions support nD input, not just 1D/2D
 def dotw(
     data_a: NDArray[np.floating],
     data_b: NDArray[np.floating],
@@ -187,9 +186,10 @@ def varw(
     keepdims: bool = False
 ) -> float:
     """
-    Mass-weighted variance of each brain map, equivalent to ``sum((data - mean) * (mass @ (data -
-    mean))) / mass.sum()``. Note that this function does not offer Bessel's correction, as mesh
-    vertices are not IID samples and maps typically display spatial autocorrelation.
+    Mass-weighted variance of each brain map, equivalent to ``sum((data - meanw(data, mass)) * (mass
+    @ (data - meanw(data, mass)))) / mass.sum()``. Note that this function does not offer Bessel's
+    correction, as mesh vertices are not IID samples and maps typically display spatial
+    autocorrelation.
 
     Parameters
     ----------
@@ -252,7 +252,6 @@ def momentw(
         return varw(data, mass, keepdims=keepdims)
     else:
         # Approximate by lumping
-        # TODO: ask MGH why lumping is an approximation. isn't meanw(f, areas) = meanw(f, mass)?
         areas = _mass_to_areas(mass, data.shape[0])
         data_dm = demeanw(data, areas)
         # Sum rows of the sparse matrix to get a lumped vector, safely flattened
@@ -521,15 +520,15 @@ def lstsqw(
     Cholesky decomposition of the symmetric positive definite mass matrix (M = L L^T), we can
     transform the mass-weighted norm into a typical Euclidean norm:
     
-    || b - A x ||_(2,mass)^2 = (b - A x)^T M (b - A x)
-                             = (b - A x)^T L L^T (b - A x)
-                             = (L^T(b - A x))^T (L^T(b - A x))
-                             = ((L^T b) - (L^T A) x)^T ((L^T b) - (L^T A) x)
-                             = || (L^T b) - (L^T A) x ||_(2,Euclidean)^2
+    ||b-Ax||_(2,mass)^2 = (b-Ax)ᵀM(b-Ax)
+                        = (b-Ax)ᵀLLᵀ(b-Ax)
+                        = (Lᵀ(b-Ax))ᵀ(Lᵀ(b-Ax))
+                        = ((Lᵀb)-(LᵀA)x)ᵀ((Lᵀb)-(LᵀA)x)
+                        = ||(Lᵀb)-(LᵀA)x||_(2,Euclidean)^2
     
     The above tells us that we can still use a standard least squares solver if we simply scale the
-    data by L^T. This is equivalent to using np.linalg.solve(a.T @ mass @ a, a.T @ mass @ b) but is
-    more efficient and numerically stable.
+    data by Lᵀ. This is equivalent to using np.linalg.solve(a.T @ mass @ a, a.T @ mass @ b) but is
+    more efficient and numerically stable. Note that for lumped (diagonal) mass, L = Lᵀ = sqrt(M).
     """
     ved = EigenData(data=(data_a, data_b), mass=mass)
     a, b = ved.data

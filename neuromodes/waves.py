@@ -273,8 +273,8 @@ def sim_nft_waves(
 
 def balloon_model(
     activity: NDArray[np.floating],
-    dt: float,
     emodes: NDArray[np.floating],
+    dt: float,
     method: _PDEKind = "fourier",
     mass: csc_matrix | None = None,
     padding_tol: np.floating | Literal['nt'] = 1e-5,
@@ -429,35 +429,39 @@ def _gen_noise(
 
     Notes
     -----
-    By sampling each element of the noise array (F) from the standard normal distribution, the
-    expected Gram matrix becomes:
-    
-    E(F[:,t0].T F[:,t1]) = 0 ∀ t0 ≠ t1  (temporal independence),
-    E(F[:,t0].T F[:,t0]) = E(sum_k^n_samples F[k,t0]^2)
-                         = sum_k^n_samples E(F[k,t0]^2)
-                         = sum_k^n_samples 1  (unit variance)
-                         = n_samples
-    ∴ E(F^T F) = n_samples I
+    A vector of standard normal noise (f) has an expected Euclidean mean and variance of 0 and 1,
+    respectively. However, in vertex space, a map's mean and variance are weighted by the mass
+    matrix. As such, spatial noise must account for this mass-weighting. This is achieved by
+    leveraging the Cholesky decomposition of the symmetric positive definite mass matrix: M = LLᵀ,
+    where L is lower triangular. By defining the mass-normalized noise as w = L⁻ᵀf, the expected
+    mean and variance are preserved independent of the mass matrix:
 
-    For noise in vertex space, we must correct each map (column) to account for mass-weighting in
-    the Gram matrix. This is achieved by leveraging the Cholesky decomposition of the symmetric
-    positive definite mass matrix: M = L L^T, where L is lower triangular. By defining the
-    mass-normalized noise as W = L^(-T) F, the expected Gram matrix is preserved:
-    
-    E(W^T M W) = E((L^(-T) F)^T (L L^T) (L^(-T) F))
-               = E(F^T L^(-1) L L^T L^(-T) F)
-               = E(F^T F)
-               = n_samples I
+    E[μ(w)] = E[sum(Mw) / sum(M)]
+            = E[1ᵀ(LLᵀ)(L⁻ᵀf) / (1ᵀM1)]
+            = (1ᵀLE[f]) / (1ᵀM1)
+            = (1ᵀL0) / (1ᵀM1)
+            = 0
+
+    E[σ^2(w)] = E[(w-μ(w))ᵀM(w-μ(w))]
+              = E[wᵀMw - wᵀMμ(w) - μ(w)ᵀMw + μ(w)ᵀMμ(w)]
+              = E[wᵀMw] - E[wᵀMμ(w)] - E[μ(w)ᵀMw] + E[μ(w)ᵀMμ(w)]
+              = E[(L⁻ᵀf)ᵀ(LLᵀ)(L⁻ᵀf)] - E[wᵀ]ME[μ(w)] - E[μ(w)]ᵀME[w] + E[μ(w)ᵀ]ME[μ(w)]
+              = E[fᵀ(L⁻¹LLᵀL⁻ᵀ)f] - 0 - 0 + 0 
+              = E[fᵀf]
+              = E[sum_i^n(f_i^2)]
+              = nE[f_i^2]
+              = n
     
     However, since the weak form PDE of the NFT wave model's FEM solver needs mass-weighting, we can
     pre-factor this into our noise generation:
     
-    M W = M L^(-T) F
-        = L L^T L^(-T) F
-        = L F.
+    Mw = ML⁻ᵀf
+       = LLᵀL⁻ᵀf
+       = Lf
 
-    This lets us use a simple sparse multiplication instead of the slower and less numerically
-    stable ``scipy.sparse.linalg.spsolve_triangular(L.T, noise)``.
+    This lets us use a simple sparse multiplication instead of obtaining w = L⁻ᵀf via the slower and
+    less numerically stable ``scipy.sparse.linalg.spsolve_triangular(L.T, f)``. Note that for lumped
+    (diagonal) mass, L = Lᵀ = sqrt(M).
     """
 
     # Draw samples from N(0, 1) in column-major order to ensure reproducibility across nt, then
@@ -468,7 +472,7 @@ def _gen_noise(
     if mass is None:  # e.g., modes along rows
         return noise
 
-    # vertex space, pre-weighted by L^T Cholesky factor
+    # vertex space, pre-weighted by Cholesky factor
     return _mult_by_cholesky(noise, mass, transpose=False)
 
 def _model_wave_fourier(
