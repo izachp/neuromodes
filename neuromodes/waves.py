@@ -13,7 +13,7 @@ import numpy as np
 import scipy.fft
 from numpy.typing import NDArray
 from scipy.integrate import solve_ivp
-from scipy.interpolate import make_interp_spline
+from scipy.interpolate import PchipInterpolator
 from scipy.sparse.linalg import eigsh, splu
 
 from neuromodes.basis import decompose
@@ -225,8 +225,8 @@ def sim_nft_waves(
     if max_freq >= 1 / (2 * dt):
         dt_nyquist = 1 / (2 * max_freq)
         warn(f"dt={dt} is too large to capture frequencies produced by the highest-frequency mode "
-             f"({max_freq:.4f} Hz), per the Nyquist-Shannon sampling theorem. Consider reducing dt "
-             f"to below {dt_nyquist:.4f} to reduce aliasing.")
+             f"({max_freq:.4f} Hz), per the Nyquist-Shannon sampling theorem. To reduce aliasing, "
+             f"consider reducing dt to below {dt_nyquist:.4f}.")
 
     # Process or generate external input
     if ext_input is not None:
@@ -700,8 +700,12 @@ def _model_wave_ode(
     n_modes, nt = input_coeffs.shape
     t_vec = np.linspace(0, dt * (nt - 1), nt)
     
-    # Create linear interpolator for input, as solver may need intermediate timepoints
-    input_interp = make_interp_spline(t_vec, input_coeffs, k=1, axis=1, check_finite=False)
+    # Create interpolator for input, as solver may need intermediate timepoints
+    # Linear interpolation creates sharp corners and thus numerical instabilities in the solver
+    # Cubic splining is better but can overshoot/undershoot and create preceding inputs
+    # PCHIP is smooth and monotonic
+    # Another option is sinc interpolation, which bandlimits and thus matches the Fourier method
+    input_interp = PchipInterpolator(t_vec, input_coeffs, axis=1, extrapolate=False)
 
     # Define ODE system, needed for solve_ivp
     def wave_odes(t, y):
@@ -997,8 +1001,8 @@ def _model_balloon_ode(
     n_modes, nt = activity_coeffs.shape
     t_vec = np.linspace(0, dt * (nt - 1), nt)
 
-    # Create linear interpolator for activity, as solver may need intermediate timepoints
-    activity_interp = make_interp_spline(t_vec, activity_coeffs, k=1, axis=1, check_finite=False)
+    # Create interpolator for activity, as solver may need intermediate timepoints
+    activity_interp = PchipInterpolator(t_vec, activity_coeffs, axis=1, extrapolate=False)
 
     # Define ODE system, needed for solve_ivp
     def balloon_odes(t, y):
