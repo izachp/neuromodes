@@ -113,8 +113,6 @@ def test_sim_nft_waves_methods_bold(solver):
         assert cos > 0.6, \
             f'Fourier and ODE BOLD solutions are not correlated at r>.6 at t={t}.'
         
-# TODO: add test that BOLD FC is very similar to neural FC
-        
 def test_gen_noise_reproducibility():
     seed = 0
     noise1 = _gen_noise(5, 10, seed=seed)
@@ -236,6 +234,12 @@ def test_sim_nft_waves_balloon_param(solver):
     assert not np.allclose(bold_default, bold_custom), \
         "BOLD signals with different balloon model parameters match unexpectedly."
 
+def test_calc_balloon_nyquist(solver):
+    dt = 0.01
+    activity = solver.sim_nft_waves(nt=10, dt=dt)
+    with pytest.warns(UserWarning, match='dt=0.01 is too large'):
+        _ = solver.balloon_model(activity, dt, gamma_h=1e5)
+
 def test_calc_nft_wave_speed(solver):
 
     # Homogeneous case
@@ -254,7 +258,7 @@ def test_calc_nft_mode_freqs(solver):
     assert np.all(np.diff(freqs) > 0), "Output frequencies are not increasing."
     assert freqs[0] == 0, "Output frequency for mode 0 is not 0."
 
-def test_analytical_fc(solver):  
+def test_calc_nft_fc(solver):  
     sim_ts = solver.sim_nft_waves(nt=5000, dt=0.01, seed=0)
     # Check that simulated FC from waves aligns with the analytical FC
     ana_fc = calc_nft_fc(solver.emodes, solver.evals, r=17.4)
@@ -296,4 +300,5 @@ def test_fem_no_joblib(solver):
         assert fem_ts.shape == (solver.n_verts, nt), \
             "FEM output shape is incorrect when joblib is not installed."
 
+# TODO: add test that BOLD FC is very similar to analytical FC
 # TODO: check n_jobs=-1 gives same result as n_jobs=1

@@ -213,7 +213,7 @@ def sim_nft_waves(
                               "'cache' extra to include joblib as a dependency (e.g., pip install "
                               "neuromodes[cache]). ")
 
-    # Check that dt is large enough to capture highest frequency, per Nyquist-Shannon theorem
+    # Check that dt is small enough to capture highest frequency, per Nyquist-Shannon theorem
     # Highest frequency comes from the mode with the highest eigenvalue
     # This needs to be computed for the FEM method
     max_eval = eigsh(stiffness, M=mass, k=1, which='LM', return_eigenvectors=False)[0] \
@@ -400,12 +400,20 @@ def balloon_model(
     activity: NDArray[np.floating],
     emodes: NDArray[np.floating],
     dt: float,
+    kappa: float = 0.65,
+    tau: float = 0.98,
+    alpha: float = 0.32,
+    rho: float = 0.34,
+    V_0: float = 0.02,
+    gamma_h: float = 0.41,
+    k1: float = 3.72,
+    k2: float = 0.527,
+    k3: float = 0.48,
     method: _PDEKind = "fourier",
-    mass: csc_matrix | None = None,
     padding_tol: np.floating | Literal['nt'] = 1e-5,
+    mass: csc_matrix | None = None,
     checks: _CheckKind = True,
-    n_jobs: int = 1,
-    **params
+    n_jobs: int = 1
 ) -> NDArray[np.floating]:
     """
     Transform simulated activity to blood oxygen level-dependent (BOLD) signal using the
@@ -421,11 +429,12 @@ def balloon_model(
     dt : float, optional
         Time step of simulated activity in seconds.
     method : str, optional
-        Method for solving the balloon PDEs. Either ``'fourier'`` or ``'ode'``. Default is
+        Method for solving the balloon PDEs. Either ``'fourier'`` or ``'ode'``. Note that
+        ``'fourier'`` relies on a first-order approximation of the nonlinear ODE system. Default is
         ``'fourier'``.
     mass : array-like, optional
-        The mass matrix of shape (n_verts, n_verts) used for the decomposition when method is
-        ``'project'``. Default is ``None``.
+        The mass matrix of shape (n_verts, n_verts), used for the decomposition of activity. Default
+        is ``None``, which uses the identity matrix.
     padding_tol : float, optional
         Tolerance for Fourier wrap-around artifacts, between ``0`` and ``1``. Lower values increase
         the amount of zero-padding and thus the simulation time and memory usage. The number of
@@ -472,11 +481,19 @@ def balloon_model(
         raise ValueError("dt must be positive.")
     if method not in ['fourier', 'ode']:
         raise ValueError(f"Invalid PDE method '{method}'; must be 'fourier' or 'ode'.")
+    params = {"kappa": kappa, "tau": tau, "alpha": alpha, "rho": rho, "V_0": V_0,
+              "gamma_h": gamma_h, "k1": k1, "k2": k2, "k3": k3}
     for param_name, param_value in params.items():
         if not isinstance(param_value, (int, float)) or param_value <= 0:
             raise ValueError(f"Parameter '{param_name}' must be a positive number.")
 
-    # TODO: add Nyquist check
+    # check that dt is sufficiently small to capture frequency
+    w_f = np.sqrt(gamma_h - kappa**2/4) / (2 * np.pi)  # Hz
+    if w_f >= 1 / (2 * dt):
+        dt_nyquist = 1 / (2 * w_f)
+        warn(f"dt={dt} is too large to capture the linearised blood flow response frequency "
+             f"({w_f:.4f} Hz), per the Nyquist-Shannon sampling theorem. To reduce aliasing, "
+             f"consider reducing dt to below {dt_nyquist:.4f}.")
 
     # Eigendecompose activity to get modal coefficients over time
     # TODO: consider re-adding sim_nft_waves(..., return_bold=False) to avoid redundant
@@ -484,9 +501,11 @@ def balloon_model(
     activity_coeffs = decompose(activity, emodes, mass=mass, checks=False)
 
     # Apply model to each mode's activity timeseries
-    bold_coeffs = (_model_balloon_fourier(activity_coeffs, dt, padding_tol, n_jobs, **params)
+    bold_coeffs = (_model_balloon_fourier(activity_coeffs, dt, padding_tol, n_jobs, kappa, tau,
+                                          alpha, rho, V_0, w_f, k1, k2, k3)
                    if method == 'fourier' else
-                   _model_balloon_ode(activity_coeffs, dt, **params))
+                   _model_balloon_ode(activity_coeffs, dt, kappa, tau, alpha, rho, V_0, gamma_h, k1,
+                                      k2, k3))
 
     # Transform timeseries from modal coefficients back to vertex space
     return emodes @ bold_coeffs
@@ -603,7 +622,9 @@ def _model_wave_fourier(
         Tolerance for Fourier wrap-around artifacts, between ``0`` and ``1``. Lower values increase
         the amount of zero-padding and thus the simulation time and memory usage. The number of
         padding timepoints is given by -ln(``padding_tol``)/(``gamma``*``dt``), meaning that a value
-        of ``1`` at t=0 wraps around to a value of ``padding_tol`` at t=nt-1.
+        of ``1`` at t=0 wraps around to a value of ``padding_tol`` at t=``nt``-1. For more details,
+        see
+        https://github.com/NSBLab/neuromodes/blob/main/docs/validation/waves_fourier_padding.ipynb.
     n_jobs : int, optional
         Number of threads to use for speeding up computation.
 
@@ -611,23 +632,7 @@ def _model_wave_fourier(
     -------
     out : ndarray
         The real part of the time-domain response of all modes at the specified time points, with
-        shape ``(n_modes, nt)``.
-    
-    Notes
-    -----
-    This function uses a frequency-domain method to simulate the damped wave response of a causal
-    input. To ensure causality (i.e., the input is zero for t < 0), the input is zero-padded on the
-    negative time axis and transformed using ``scipy.fft.ifft``, which mimics the forward Fourier
-    transform of a causal signal. The system's frequency response (transfer function) is then
-    applied, and ``scipy.fft.fft`` is used to return to the time domain. This approach is standard
-    for simulating linear time-invariant causal systems and is equivalent to convolution with a
-    Green's function.
-
-    The sequence is:
-      1. Zero-pad input for t < 0 (causality)
-      2. Take ifft to get the frequency-domain representation for this causal signal
-      3. Apply the frequency response (transfer function)
-      4. Use fft to return to the time domain (with appropriate shifts)
+        shape ``(n_modes, nt)``.    
     """
     nt = input_coeffs.shape[1]
 
@@ -836,15 +841,15 @@ def _model_balloon_fourier(
     dt: float,
     padding_tol: float | Literal['nt'],
     n_jobs: int,
-    kappa: float = 0.65,
-    tau: float = 0.98,
-    alpha: float = 0.32,
-    rho: float = 0.34,
-    V_0: float = 0.02,
-    w_f: float = 0.56,
-    k1: float = 3.72,
-    k2: float = 0.527,
-    k3: float = 0.48
+    kappa: float,
+    tau: float,
+    alpha: float,
+    rho: float,
+    V_0: float,
+    w_f: float,
+    k1: float,
+    k2: float,
+    k3: float
 ) -> NDArray[np.floating]:
     """
     Simulates the hemodynamic response of all modes using the balloon model in the frequency domain.
@@ -863,49 +868,34 @@ def _model_balloon_fourier(
         the amount of zero-padding and thus the simulation time and memory usage. The number of
         padding timepoints is given by -ln(``padding_tol``)/(``dt`` * min(``kappa``/2, 1/``tau``,
         1/(``tau`` * ``alpha``))), meaning that a value of ``1`` at t=0 wraps around to a value of
-        approximately ``padding_tol`` at t=``nt``-1.
+        approximately ``padding_tol`` at t=``nt``-1. For more details, see
+        https://github.com/NSBLab/neuromodes/blob/main/docs/validation/waves_fourier_padding.ipynb.
     n_jobs : int, optional
         Number of threads to use for speeding up computation.
     kappa : float, optional
-        Signal decay rate in seconds^-1. Default is ``0.65``.
+        Signal decay rate in seconds^-1.
     tau : float, optional
-        Hemodynamic transit time in seconds. Default is ``0.98``.
+        Hemodynamic transit time in seconds.
     alpha : float, optional
-        Grubb's exponent (unitless). Default is ``0.32``.
+        Grubb's exponent (unitless).
     rho : float, optional
-        Resting oxygen extraction fraction (unitless). Default is ``0.34``.
+        Resting oxygen extraction fraction (unitless).
     V_0 : float, optional
-        Resting blood volume fraction (unitless). Default is ``0.02``.
+        Resting blood volume fraction (unitless).
     w_f : float, optional
-        Frequency of blood flow response in radians per second. Default is ``0.56``.
+        Frequency of blood flow response in radians per second.
     k1 : float, optional
-        First coefficient in BOLD signal equation (unitless). Default is ``3.72``
+        First coefficient in BOLD signal equation (unitless).
     k2 : float, optional
-        Second coefficient in BOLD signal equation (unitless). Default is ``0.527``.
+        Second coefficient in BOLD signal equation (unitless).
     k3 : float, optional
-        Third coefficient in BOLD signal equation (unitless). Default is ``0.48``.
+        Third coefficient in BOLD signal equation (unitless).
 
     Returns
     -------
     np.ndarray
         The real part of the time-domain response of all modes at the specified time points, with
         shape (n_modes, nt).
-
-    Notes
-    -----
-    This function uses a frequency-domain method to simulate the damped wave response of a causal 
-    input. To ensure causality (i.e., the input is zero for t < 0), the input is zero-padded on the 
-    negative time axis and transformed using ``scipy.fft.rfft``, which mimics the forward Fourier
-    transform of a causal signal. The system's frequency response (transfer function) is then
-    applied, and ``scipy.fft.irfft`` is used to return to the time domain. This approach is standard
-    for simulating linear time-invariant causal systems and is equivalent to convolution with a
-    Green's function.
-
-    The sequence is:
-      1. Zero-pad input for t < 0 (causality)
-      2. Take rfft to get the frequency-domain representation for this causal signal
-      3. Apply the frequency response (transfer function)
-      4. Use irfft to return to the time domain (with appropriate shifts)
     """
     nt = activity_coeffs.shape[1]
     
@@ -948,15 +938,15 @@ def _model_balloon_fourier(
 def _model_balloon_ode(
     activity_coeffs: NDArray[np.floating],
     dt: float,
-    kappa: float = 0.65,
-    tau: float = 0.98,
-    alpha: float = 0.32,
-    rho: float = 0.34,
-    V_0: float = 0.02,
-    gamma_h: float = 0.41,
-    k1: float = 3.72,
-    k2: float = 0.527,
-    k3: float = 0.48
+    kappa: float,
+    tau: float,
+    alpha: float,
+    rho: float,
+    V_0: float,
+    gamma_h: float,
+    k1: float,
+    k2: float,
+    k3: float
 ) -> NDArray[np.floating]:
     """
     Simulates the hemodynamic response of all modes using the balloon model in the time domain (ODE 
@@ -971,21 +961,21 @@ def _model_balloon_ode(
     dt : float
         Time step for the simulation in seconds.
     kappa : float, optional
-        Signal decay rate in seconds^-1. Default is ``0.65``.
+        Signal decay rate in seconds^-1.
     tau : float, optional
-        Hemodynamic transit time in seconds. Default is ``0.98``.
+        Hemodynamic transit time in seconds.
     alpha : float, optional
-        Grubb's exponent (unitless). Default is ``0.32``.
+        Grubb's exponent (unitless).
     V_0 : float, optional
-        Resting blood volume fraction (unitless). Default is ``0.02``.
+        Resting blood volume fraction (unitless).
     gamma_h : float, optional
-        Hemodynamic gain (unitless). Default is ``0.41``.
+        Hemodynamic gain (unitless).
     k1 : float, optional
-        First coefficient in BOLD signal equation (unitless). Default is ``3.72``.
+        First coefficient in BOLD signal equation (unitless).
     k2 : float, optional
-        Second coefficient in BOLD signal equation (unitless). Default is ``0.527``.
+        Second coefficient in BOLD signal equation (unitless).
     k3 : float, optional
-        Third coefficient in BOLD signal equation (unitless). Default is ``0.48``.
+        Third coefficient in BOLD signal equation (unitless).
 
     Returns
     -------
