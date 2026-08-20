@@ -14,7 +14,7 @@ import scipy.fft
 from numpy.typing import NDArray
 from scipy.integrate import solve_ivp
 from scipy.interpolate import make_interp_spline
-from scipy.sparse.linalg import splu
+from scipy.sparse.linalg import eigsh, splu
 
 from neuromodes.basis import decompose
 from neuromodes.eigen import EigenData
@@ -168,7 +168,7 @@ def sim_nft_waves(
             ved.emodes, ved.evals, ved.mass, ved.stiffness, ved.data, ved.hetero
         
     if emodes is not None: 
-        n_modes = emodes.shape[1]
+        n_verts, n_modes = emodes.shape
     elif stiffness is not None:
         n_verts = stiffness.shape[0]
     elif method == 'fem':
@@ -213,20 +213,20 @@ def sim_nft_waves(
                               "'cache' extra to include joblib as a dependency (e.g., pip install "
                               "neuromodes[cache]). ")
 
-    if method != 'fem':
-        # Calculate undamped frequencies produced by each mode (Hz)
-        mode_freqs = gamma * np.sqrt(1 + r**2 * evals) / (2 * np.pi)
-        modes_is_nyquist = dt < 1 / (2 * mode_freqs)
+    # Check that dt is large enough to capture highest frequency, per Nyquist-Shannon theorem
+    # Highest frequency comes from the mode with the highest eigenvalue
+    # This needs to be computed for the FEM method
+    max_eval = eigsh(stiffness, M=mass, k=1, which='LM', return_eigenvectors=False)[0] \
+        if method == 'fem' else evals[-1]
 
-        # Check if highest-frequency mode is above Nyquist limit
-        if not modes_is_nyquist[-1]:
-            dt_max = 1 / (2 * mode_freqs[-1])
-            mode_idx = np.argmax(~modes_is_nyquist)
-            warn(f"dt={dt} is too large to capture frequencies produced by mode {mode_idx+1} "
-                 f"({mode_freqs[mode_idx]:.4f} Hz) and beyond, per the Nyquist limit. Consider "
-                 f"reducing dt to {dt_max:.4f} or lower. If simulated activity will be temporally "
-                 "smoothed and/or downsampled (e.g., by the Balloon-Windkessel model), this may "
-                 "not be a concern.")
+    max_freq = calc_nft_mode_freqs(max_eval, r, gamma)
+
+    # Check if highest-frequency mode is above Nyquist limit
+    if max_freq >= 1 / (2 * dt):
+        dt_nyquist = 1 / (2 * max_freq)
+        warn(f"dt={dt} is too large to capture frequencies produced by the highest-frequency mode "
+             f"({max_freq:.4f} Hz), per the Nyquist-Shannon sampling theorem. Consider reducing dt "
+             f"to below {dt_nyquist:.4f} to reduce aliasing.")
 
     # Process or generate external input
     if ext_input is not None:
@@ -274,6 +274,127 @@ def sim_nft_waves(
                        _model_wave_ode(input_coeffs, dt, r, gamma, evals))
 
     return emodes @ activity_coeffs
+
+def calc_nft_wave_speed(
+    r: float,
+    gamma: float,
+    hetero: NDArray[np.floating] | None = None
+) -> float | NDArray[np.floating]:
+    """
+    Calculate wave speed (m/s) based on the two parameters of the wave model. If a scaled
+    heterogeneity map is provided, wave speeds are calculated for each cortical vertex (i.e., each
+    entry of ``hetero``).
+    
+    Parameters
+    ----------
+    r : float
+        Axonal length scale for wave propagation in millimeters.
+    gamma : float
+        Damping parameter for wave propagation in seconds^-1.
+    hetero : array-like, optional
+        Scaled heterogeneity map of shape (n_verts,). If ``None``, wave speed is assumed to be
+        spatially uniform. To scale a heterogeneity map, use :func:eigen.scale_hetero. Default is
+        ``None``.
+    
+    Returns
+    -------
+    float or np.ndarray
+        Wave speed across the whole cortex in meters per second, or at each vertex if ``hetero`` is
+        provided.
+    """
+    speed = (r / 1000) * gamma # Convert r to meters
+    if hetero is not None:
+        speed *= np.sqrt(hetero)
+
+    return speed
+
+def calc_nft_mode_freqs(
+    evals: NDArray[np.floating],
+    r: float,
+    gamma: float
+) -> NDArray[np.floating]:
+    """
+    Calculate the damped frequencies (Hz) produced by each mode of the wave model. Note that all
+    modes are underdamped, except the first which has an eigenvalue of 0 and thus is critically
+    damped (see Notes).
+
+    Parameters
+    ----------
+    evals : np.ndarray
+        Eigenvalues corresponding to the modes, with shape ``(n_modes,)``.
+    r : float
+        Spatial length scale of wave propagation in millimeters.
+    gamma : float
+        Damping rate of wave propagation in seconds^(-1).
+
+    Returns
+    -------
+    np.ndarray
+        Damped frequencies of shape ``(n_modes,)``.
+
+    Notes
+    -----
+    NFT wave equation for mode j is given by
+    
+        [1/gamma^2 d^2/dt^2 + 2/gamma d/dt + (1 + r^2 eval_j)] phi_j(t) = Q_j(t)
+
+    where phi_j(t) is the activity of mode j, eval_j is the eigenvalue of mode j, and Q_j(t) is
+    the external input. Mapping these to the classical driven harmonic oscillator equation, we have:
+
+        m d^2/dt^2 phi_j(t) + c d/dt phi_j(t) + k phi_j(t) = Q_j(t)
+        m = 1/gamma^2, c = 2/gamma, k = 1 + r^2 eval_j
+
+    The damped angular frequency of mode j (omega_d_j) is then derived from the undamped angular
+    frequency (omega_u_j) and damping ratio (zeta_j) as:
+    
+        omega_d_j = omega_u_j * √(1 - zeta_j^2)
+                  = √(k/m) * √(1 - (c/(2*√(k/m)))^2)
+                  = √(k/m - c^2/(4*m^2))
+                  = √((1 + r^2 eval_j) * gamma^2 - (2/gamma)^2 / (4 * (1/gamma^2)^2)
+                  = √((1 + r^2 eval_j) * gamma^2 - gamma^2)
+                  = gamma * √(r^2 eval_j)
+    """
+    # Calculate and convert from rad/s to Hz
+    return gamma * np.sqrt(r**2 * evals) / (2 * np.pi)
+
+def calc_nft_fc(
+    emodes: NDArray[np.floating],
+    evals: NDArray[np.floating],
+    r: float
+) -> NDArray[np.floating]:
+    """
+    Calculate the analytical FC for the wave model under white noise input.
+
+    Parameters
+    ----------
+    emodes : np.ndarray
+        Eigenmodes of shape ``(n_verts, n_modes)``.
+    evals : np.ndarray
+        Eigenvalues corresponding to the modes, with shape ``(n_modes,)``.
+    r : float
+        Spatial length scale of wave propagation in millimeters.
+
+    Returns
+    -------
+    np.ndarray
+        Analytical FC matrix of shape ``(n_verts, n_verts)``.
+    """
+    ved = EigenData(emodes=emodes, evals=evals, checks=False)
+    emodes, evals = ved.emodes, ved.evals
+
+    # Compute the variance of each mode's activity timeseries by applying Parseval's identity to the
+    # NFT operator. This is equivalent to integrating the power spectral density of each mode's
+    # response over all frequencies, which yields the variance of the mode's activity timeseries.
+    # NOTE: technically the denominator should be multiplied by 2*gamma, but we can ignore this here
+    # since correlation normalises this out later (i.e., gamma has no effect on model FC)
+    mode_vars = 1.0 / (1 + r**2 * evals)
+
+    # reconstruct (change from modal to vertex basis)
+    cov = emodes @ (mode_vars[:, None] * emodes.T)
+
+    # Normalise variance-covariance matrix to get correlation
+    stds = np.sqrt(np.diag(cov))
+    return cov / stds[:, None] / stds[None, :]
 
 def balloon_model(
     activity: NDArray[np.floating],
@@ -369,39 +490,6 @@ def balloon_model(
 
     # Transform timeseries from modal coefficients back to vertex space
     return emodes @ bold_coeffs
-
-def calc_nft_wave_speed(
-    r: float,
-    gamma: float,
-    hetero: NDArray[np.floating] | None = None
-) -> float | NDArray[np.floating]:
-    """
-    Calculate wave speed (m/s) based on the two parameters of the wave model. If a scaled
-    heterogeneity map is provided, wave speeds are calculated for each cortical vertex (i.e., each
-    entry of ``hetero``).
-    
-    Parameters
-    ----------
-    r : float
-        Axonal length scale for wave propagation in millimeters.
-    gamma : float
-        Damping parameter for wave propagation in seconds^-1.
-    hetero : array-like, optional
-        Scaled heterogeneity map of shape (n_verts,). If ``None``, wave speed is assumed to be
-        spatially uniform. To scale a heterogeneity map, use :func:eigen.scale_hetero. Default is
-        ``None``.
-    
-    Returns
-    -------
-    float or np.ndarray
-        Wave speed across the whole cortex in meters per second, or at each vertex if ``hetero`` is
-        provided.
-    """
-    speed = (r / 1000) * gamma # Convert r to meters
-    if hetero is not None:
-        speed *= np.sqrt(hetero)
-
-    return speed
 
 def _gen_noise(
     n_samples: int,
@@ -953,42 +1041,3 @@ def _model_balloon_ode(
     # Compute BOLD
     _, _, v, q = np.split(sol.y, 4)
     return V_0 * (k1 * (1 - q) + k2 * (1 - q / v) + k3 * (1 - v))
-
-def calc_nft_fc(
-    emodes: NDArray[np.floating],
-    evals: NDArray[np.floating],
-    r: float
-) -> NDArray[np.floating]:
-    """
-    Calculate the analytical FC for the wave model under white noise input.
-
-    Parameters
-    ----------
-    emodes : np.ndarray
-        Eigenmodes of shape ``(n_verts, n_modes)``.
-    evals : np.ndarray
-        Eigenvalues corresponding to the modes, with shape ``(n_modes,)``.
-    r : float
-        Spatial length scale of wave propagation in millimeters.
-
-    Returns
-    -------
-    np.ndarray
-        Analytical FC matrix of shape ``(n_verts, n_verts)``.
-    """
-    ved = EigenData(emodes=emodes, evals=evals, checks=False)
-    emodes, evals = ved.emodes, ved.evals
-
-    # Compute the variance of each mode's activity timeseries by applying Parseval's identity to the
-    # NFT operator. This is equivalent to integrating the power spectral density of each mode's
-    # response over all frequencies, which yields the variance of the mode's activity timeseries.
-    # NOTE: technically the denominator should be multiplied by 2*gamma, but we can ignore this here
-    # since correlation normalises this out later (i.e., gamma has no effect on model FC)
-    mode_vars = 1.0 / (1 + r**2 * evals)
-
-    # reconstruct (change from modal to vertex basis)
-    cov = emodes @ (mode_vars[:, None] * emodes.T)
-
-    # Normalise variance-covariance matrix to get correlation
-    stds = np.sqrt(np.diag(cov))
-    return cov / stds[:, None] / stds[None, :]

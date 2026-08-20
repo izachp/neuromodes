@@ -541,12 +541,12 @@ def lstsqw(
     ab = np.concatenate([a, b], axis=1)
 
     # multiply and unpack
-    sqrtmass_ab = _mult_by_cholesky(ab, mass, transpose=True)
-    sqrtmass_a = sqrtmass_ab[:, :a.shape[1]]
-    sqrtmass_b = sqrtmass_ab[:, a.shape[1]:]
+    LT_ab = _mult_by_cholesky(ab, mass, transpose=True)
+    LT_a = LT_ab[:, :a.shape[1]]
+    LT_b = LT_ab[:, a.shape[1]:]
 
     # Get results from standard least squares solver
-    return np.linalg.lstsq(sqrtmass_a, sqrtmass_b, rcond=rcond)
+    return np.linalg.lstsq(LT_a, LT_b, rcond=rcond)
 
 def parcellate(
     data: NDArray[np.floating],

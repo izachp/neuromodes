@@ -9,7 +9,13 @@ from scipy.sparse.linalg import splu
 from neuromodes import EigenSolver
 from neuromodes.io import fetch_example_map, fetch_example_surf
 from neuromodes.stats import cdistw, gramw, sigmoid_rescale, zscorew
-from neuromodes.waves import _gen_noise, calc_nft_fc, calc_nft_wave_speed, sim_nft_waves
+from neuromodes.waves import (
+    _gen_noise,
+    calc_nft_fc,
+    calc_nft_mode_freqs,
+    calc_nft_wave_speed,
+    sim_nft_waves,
+)
 
 
 @pytest.fixture(scope="module")
@@ -241,6 +247,13 @@ def test_calc_nft_wave_speed(solver):
     assert np.all(speed > 0), "Output contains non-positive wave speeds when using hetero."
     assert speed.shape == (solver.n_verts,), "Output shape is incorrect when using hetero." # type: ignore
 
+def test_calc_nft_mode_freqs(solver):
+    freqs = calc_nft_mode_freqs(solver.evals, r=18.0, gamma=116)
+    assert np.all(freqs[1:] > 0), "Output contains non-positive frequencies past mode 0."
+    assert freqs.shape == (solver.n_modes,), "Output shape is incorrect when using hetero."
+    assert np.all(np.diff(freqs) > 0), "Output frequencies are not increasing."
+    assert freqs[0] == 0, "Output frequency for mode 0 is not 0."
+
 def test_analytical_fc(solver):  
     sim_ts = solver.sim_nft_waves(nt=5000, dt=0.01, seed=0)
     # Check that simulated FC from waves aligns with the analytical FC
@@ -252,14 +265,17 @@ def test_analytical_fc(solver):
 def test_fem_alignment(solver):
     # Check that modal approximation aligns with FEM solution
     nt=50
-    dt=0.01
+    
     # construct input using first modes only to remove truncation error
     ext_input = solver.emodes @ _gen_noise(solver.n_modes, nt, seed=0)
+
+    dt=0.01  # usually insufficient for FEM, but fine since ext_input is truncated
 
     fourier_ts = solver.sim_nft_waves(dt=dt, ext_input=ext_input)
 
     # Run FEM simulation
-    fem_ts = solver.sim_nft_waves(dt=dt, ext_input=ext_input, method='fem')
+    with pytest.warns(UserWarning, match="dt=0.01 is too large"):
+        fem_ts = solver.sim_nft_waves(dt=dt, ext_input=ext_input, method='fem')
 
     # Assess
     for t in range(10, nt):
