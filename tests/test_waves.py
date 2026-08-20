@@ -9,7 +9,7 @@ from scipy.sparse.linalg import splu
 from neuromodes import EigenSolver
 from neuromodes.io import fetch_example_map, fetch_example_surf
 from neuromodes.stats import cdistw, gramw, sigmoid_rescale, zscorew
-from neuromodes.waves import _gen_noise, calc_nft_fc, calc_wave_speed, sim_nft_waves
+from neuromodes.waves import _gen_noise, calc_nft_fc, calc_nft_wave_speed, sim_nft_waves
 
 
 @pytest.fixture(scope="module")
@@ -32,7 +32,7 @@ def test_unusual_wave_speed_no_hetero(solver):
             mass=solver.mass,
             r=1000,
             speed_limits=(0, 115),
-            nt=100
+            nt=10
             )
 
 def test_single_speed_limit(solver):
@@ -166,7 +166,6 @@ def test_sim_nft_waves_reproducibility_fourier(solver):
 
     mse01 = np.mean((ts0 - ts1[:, :nt])**2)
     mse02 = np.mean((ts0 - ts2)**2)
-    print(f"MSE between same seed: {mse01:.4e}, MSE between different seeds: {mse02:.4e}")
     assert mse01 < 2e-7, \
         f"Simulated timeseries with the same seed do not match (MSE={mse01:.4e})."
     assert mse02 > 3e-4, \
@@ -182,9 +181,9 @@ def test_sim_nft_waves_invalid_method(solver):
     with pytest.raises(ValueError, match="Invalid PDE method 'zote'"):
         solver.sim_nft_waves(nt=10, method='zote')
 
-@pytest.mark.filterwarnings("ignore:overflow encountered in scalar power:RuntimeWarning")
 @pytest.mark.filterwarnings("ignore:invalid value encountered in dot:RuntimeWarning")
-@pytest.mark.filterwarnings("ignore:invalid value encountered in scalar subtract:RuntimeWarning")
+@pytest.mark.filterwarnings("ignore:overflow encountered in power:RuntimeWarning")
+@pytest.mark.filterwarnings("ignore:invalid value encountered in subtract:RuntimeWarning")
 def test_sim_nft_waves_ode_balloon_overflow(solver):
 
     # Large dt can cause overflow errors in the dqdt expression for the ODE balloon model, so
@@ -231,14 +230,14 @@ def test_sim_nft_waves_balloon_param(solver):
     assert not np.allclose(bold_default, bold_custom), \
         "BOLD signals with different balloon model parameters match unexpectedly."
 
-def test_calc_wave_speed(solver):
+def test_calc_nft_wave_speed(solver):
 
     # Homogeneous case
-    speed = calc_wave_speed(r=18.0, gamma=116)
+    speed = calc_nft_wave_speed(r=18.0, gamma=116)
     assert isinstance(speed, float), "Output type is not float for hetero=None."
 
     # Heterogeneous case
-    speed = calc_wave_speed(r=18.0, gamma=116, hetero=solver.hetero)
+    speed = calc_nft_wave_speed(r=18.0, gamma=116, hetero=solver.hetero)
     assert np.all(speed > 0), "Output contains non-positive wave speeds when using hetero."
     assert speed.shape == (solver.n_verts,), "Output shape is incorrect when using hetero." # type: ignore
 
@@ -260,7 +259,7 @@ def test_fem_alignment(solver):
     fourier_ts = solver.sim_nft_waves(dt=dt, ext_input=ext_input)
 
     # Run FEM simulation
-    fem_ts = solver.sim_nft_waves(dt=dt, ext_input=ext_input, n_jobs=1, method='fem')
+    fem_ts = solver.sim_nft_waves(dt=dt, ext_input=ext_input, method='fem')
 
     # Assess
     for t in range(10, nt):
@@ -280,3 +279,5 @@ def test_fem_no_joblib(solver):
 
         assert fem_ts.shape == (solver.n_verts, nt), \
             "FEM output shape is incorrect when joblib is not installed."
+
+# TODO: check n_jobs=-1 gives same result as n_jobs=1

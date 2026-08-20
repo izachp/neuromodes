@@ -89,7 +89,7 @@ API Reference
 
    sim_nft_waves
    balloon_model
-   calc_wave_speed
+   calc_nft_wave_speed
 
 .. _ref_network:
 

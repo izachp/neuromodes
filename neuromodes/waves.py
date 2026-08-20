@@ -10,8 +10,10 @@ from typing import TYPE_CHECKING, Literal, cast
 from warnings import warn
 
 import numpy as np
+import scipy.fft
 from numpy.typing import NDArray
 from scipy.integrate import solve_ivp
+from scipy.interpolate import make_interp_spline
 from scipy.sparse.linalg import splu
 
 from neuromodes.basis import decompose
@@ -43,8 +45,8 @@ def sim_nft_waves(
     checks: _CheckKind = True,
     seed: int | None = None,
     cache_input: bool = False,
-    n_jobs: int = 1, # only used for FEM
-    verbose: int = 0 # only used for FEM
+    n_jobs: int = 1,
+    verbose: int = 0
 ) -> NDArray[np.floating]:
     """
     Simulate neural activity using a Neural Field Theory wave model [1]_ [2]_ [3]_.
@@ -97,11 +99,12 @@ def sim_nft_waves(
         recomputation for the same values of ``nt``, ``seed``, and number of rows (vertices) in
         ``emodes`` (see :func:`~neuromodes.io._cache_output` for details). Default is ``False``.
     n_jobs : int, optional
-        Number of parallel jobs to run when ``method='fem'``. If not ``1``, ``joblib`` must be
-        installed. Default is ``1``.
+        Number of parallel jobs to run, for speeding up computation. Ignored if ``method`` is
+        ``'ode'``. If not ``1`` and ``method`` is ``'fem'``, ``joblib`` must be installed. Default
+        is ``1``. 
     verbose : int, optional
-        ``joblib`` verbosity level for parallel execution when ``method='fem'`` and ``n_jobs > 1``.
-        Default is ``0``.
+        ``joblib`` verbosity level for parallel execution when ``method`` is ``'fem'`` and ``n_jobs
+        > 1``. Default is ``0``.
 
     Returns
     -------
@@ -129,7 +132,7 @@ def sim_nft_waves(
     ValueError
         If ``ext_input`` is provided and contains any NaN values.
     ValueError
-        If ``n_jobs`` is not ``1`` and ``joblib`` is not installed.
+        If ``n_jobs`` is not ``1``, ``method`` is ``'fem'``, and ``joblib`` is not installed.
     ValueError
         If ``padding_tol`` is not between ``0`` and ``1``.
 
@@ -188,7 +191,7 @@ def sim_nft_waves(
             or speed_limits[0] < 0 or speed_limits[0] >= speed_limits[1]):
             raise ValueError("speed_limits must be a tuple of (min_speed, max_speed), where "
                              "0 ≤ min_speed < max_speed.")
-        speed = calc_wave_speed(r, gamma, hetero=hetero)
+        speed = calc_nft_wave_speed(r, gamma, hetero=hetero)
         min_speed, max_speed = np.min(speed), np.max(speed)
         if min_speed < speed_limits[0] or max_speed > speed_limits[1]:
             calc_str = min_speed if min_speed == max_speed else f"{min_speed:.1f}-{max_speed:.1f}"
@@ -202,12 +205,13 @@ def sim_nft_waves(
                                 or padding_tol <= 0 or padding_tol > 1):
         raise ValueError("padding_tol must be between 0 and 1, or 'nt'.")
     if n_jobs != 1:
-        if method != 'fem':
-            warn("n_jobs is ignored when method is not 'fem'.")
-        elif find_spec("joblib") is None:
-            raise ImportError("joblib must be installed to use n_jobs != 1 for parallel execution. "
-                              "Neuromodes can be installed with the 'cache' extra to include "
-                              "joblib as a dependency (e.g., pip install neuromodes[cache]). ")
+        if method == 'ode':
+            warn("n_jobs is ignored when method is 'ode'.")
+        elif method == 'fem' and find_spec("joblib") is None:
+            raise ImportError("When method is 'fem', joblib must be installed to use n_jobs != "
+                              "1 for parallel execution. Neuromodes can be installed with the "
+                              "'cache' extra to include joblib as a dependency (e.g., pip install "
+                              "neuromodes[cache]). ")
 
     if method != 'fem':
         # Calculate undamped frequencies produced by each mode (Hz)
@@ -224,6 +228,7 @@ def sim_nft_waves(
                  "smoothed and/or downsampled (e.g., by the Balloon-Windkessel model), this may "
                  "not be a concern.")
 
+    # Process or generate external input
     if ext_input is not None:
         if np.isnan(ext_input).any():
             raise ValueError("ext_input contains NaN values, which are not allowed.")
@@ -234,7 +239,6 @@ def sim_nft_waves(
         if cache_input:
             warn("cache_input is ignored when ext_input is provided.")
         nt = ext_input.shape[1]
-        # Process external input
         if method == 'fem':
             input_w = mass @ ext_input
         else:
@@ -260,12 +264,12 @@ def sim_nft_waves(
     # Non-modal FEM implementation
     if method == 'fem':
         if mass is None or stiffness is None:
-            raise ValueError("Mass and stiffness matrices must be provided for FEM method.")
-        return _model_wave_fem(input_w, dt=dt, r=r, gamma=gamma, mass=mass, stiffness=stiffness,
-                               padding_tol=padding_tol, n_jobs=n_jobs, verbose=verbose)
+            raise ValueError("Mass and stiffness matrices must be provided when method is 'fem'.")
+        return _model_wave_fem(input_w, mass, stiffness, dt, r, gamma, padding_tol, n_jobs,
+                               verbose)
     
-    # Standard modal implementation: decompose input and reconstruct output
-    activity_coeffs = (_model_wave_fourier(input_coeffs, dt, r, gamma, evals, padding_tol)
+    # Standard modal implementation: pass decomposed input, then output reconstruction
+    activity_coeffs = (_model_wave_fourier(input_coeffs, dt, r, gamma, evals, padding_tol, n_jobs)
                        if method == 'fourier' else
                        _model_wave_ode(input_coeffs, dt, r, gamma, evals))
 
@@ -279,6 +283,7 @@ def balloon_model(
     mass: csc_matrix | None = None,
     padding_tol: np.floating | Literal['nt'] = 1e-5,
     checks: _CheckKind = True,
+    n_jobs: int = 1,
     **params
 ) -> NDArray[np.floating]:
     """
@@ -306,6 +311,9 @@ def balloon_model(
         padding timepoints is given by -ln(``padding_tol``)/(``dt`` * min(``kappa``/2, 1/``tau``,
         1/(``tau`` * ``alpha``))), meaning that a value of ``1`` at t=0 wraps around to a value of
         approximately ``padding_tol`` at t=``nt``-1. Default is ``1e-5``.
+    n_jobs : int, optional
+        Number of threads to use for speeding up computation when ``method`` is ``'fourier'``.
+        Default is ``1``.
     checks : bool, optional
         Whether to perform checks on the input arrays. Default is ``True``.
     **params
@@ -355,14 +363,14 @@ def balloon_model(
     activity_coeffs = decompose(activity, emodes, mass=mass, checks=False)
 
     # Apply model to each mode's activity timeseries
-    bold_coeffs = (_model_balloon_fourier(activity_coeffs, dt, padding_tol, **params)
+    bold_coeffs = (_model_balloon_fourier(activity_coeffs, dt, padding_tol, n_jobs, **params)
                    if method == 'fourier' else
                    _model_balloon_ode(activity_coeffs, dt, **params))
 
     # Transform timeseries from modal coefficients back to vertex space
     return emodes @ bold_coeffs
 
-def calc_wave_speed(
+def calc_nft_wave_speed(
     r: float,
     gamma: float,
     hetero: NDArray[np.floating] | None = None
@@ -481,7 +489,8 @@ def _model_wave_fourier(
     r: float,
     gamma: float,
     evals: NDArray[np.floating],
-    padding_tol: float | Literal['nt']
+    padding_tol: float | Literal['nt'],
+    n_jobs: int
 ) -> NDArray[np.floating]:
     """
     Simulates the time evolution of wave models for all modes using a frequency-domain approach.
@@ -506,7 +515,9 @@ def _model_wave_fourier(
         Tolerance for Fourier wrap-around artifacts, between ``0`` and ``1``. Lower values increase
         the amount of zero-padding and thus the simulation time and memory usage. The number of
         padding timepoints is given by -ln(``padding_tol``)/(``gamma``*``dt``), meaning that a value
-        of ``1`` at t=0 wraps around to a value of ``padding_tol`` at t=nt-1. Default is ``1e-5``.
+        of ``1`` at t=0 wraps around to a value of ``padding_tol`` at t=nt-1.
+    n_jobs : int, optional
+        Number of threads to use for speeding up computation.
 
     Returns
     -------
@@ -518,11 +529,11 @@ def _model_wave_fourier(
     -----
     This function uses a frequency-domain method to simulate the damped wave response of a causal
     input. To ensure causality (i.e., the input is zero for t < 0), the input is zero-padded on the
-    negative time axis and transformed using ``np.fft.ifft``, which mimics the forward Fourier
+    negative time axis and transformed using ``scipy.fft.ifft``, which mimics the forward Fourier
     transform of a causal signal. The system's frequency response (transfer function) is then
-    applied, and ``np.fft.fft`` is used to return to the time domain. This approach is standard for
-    simulating linear time-invariant causal systems and is equivalent to convolution with a Green's
-    function.
+    applied, and ``scipy.fft.fft`` is used to return to the time domain. This approach is standard
+    for simulating linear time-invariant causal systems and is equivalent to convolution with a
+    Green's function.
 
     The sequence is:
       1. Zero-pad input for t < 0 (causality)
@@ -543,46 +554,46 @@ def _model_wave_fourier(
         n_pad = int(np.ceil(t_pad / dt))
     input_coeffs_padded = np.pad(input_coeffs, ((0, 0), (n_pad, 0)), constant_values=0)
 
-    # Frequency-domain representation of the causal signal
-    # Faster to use `rfft` here than `fftshift(ifft)` (original implementation)
-    input_coeffs_f = np.fft.rfft(input_coeffs_padded, axis=1)
-
-    # Frequencies for full signal
+    # Get frequencies (rad/s)
     # Negative sign in front of omega matches the physics convention of e^(iwt)
-    omega = -2 * np.pi * np.fft.rfftfreq(n_pad + nt, d=dt) # keep consistent with _model_balloon_fourier
+    omega = -2 * np.pi * scipy.fft.rfftfreq(n_pad + nt, d=dt)
 
-    # Compute transfer function and apply it to frequency-domain input
-    H = gamma**2 / (-omega**2 - 2j * omega * gamma + gamma**2 * (1 + r**2 * evals[:, None]))
-    out_fft = H * input_coeffs_f
+    # Compute NFT transfer function
+    tfunc = gamma**2 / (-omega**2 - 2j * omega * gamma + gamma**2 * (1 + r**2 * evals[:, None]))
 
-    # Inverse transform to time domain (irfft is fast)
-    out_full = np.fft.irfft(out_fft, n=n_pad+nt, axis=1)
+    # Fourier transform, apply transfer function, and inverse transform to time domain
+    # Faster to use `rfft` here than `fftshift(ifft)` (original implementation)
+    input_coeffs_f = scipy.fft.rfft(input_coeffs_padded, axis=1, overwrite_x=True, workers=n_jobs)
+
+    out_fft = tfunc * input_coeffs_f
+
+    out_full = scipy.fft.irfft(out_fft, n=n_pad+nt, axis=1, overwrite_x=True, workers=n_jobs)
 
     # Return only the non-negative time part (t >= 0)
     return out_full[:, n_pad:]
 
 def _model_wave_ode(
-    input_coeffs: NDArray[np.floating],
+    input_coeffs: np.ndarray,
     dt: float,
     r: float,
     gamma: float,
-    evals: NDArray[np.floating]
-) -> NDArray[np.floating]:
+    evals: np.ndarray
+) -> np.ndarray:
     """
     Solves the damped wave ODE for all eigenmodes.
 
     Parameters
     ----------
     input_coeffs : np.ndarray
-        Input drive to the system with shape ``(n_modes, nt)`` (written as qj in equation below).
+        Input drive to the system with shape ``(n_modes, nt)`` (written as q_j in equation below).
     dt : float
         Time step for the simulation in seconds.
     gamma : float
-        Damping coefficient seconds^-1.
+        Damping coefficient in seconds^-1.
     r : float
         Spatial length scale in millimeters.
     evals : np.ndarray
-        Eigenvalues for each mode with shape ``(n_modes,)`` (written as lambdaj in equation below).
+        Eigenvalues for each mode with shape ``(n_modes,)``.
 
     Returns
     -------
@@ -591,47 +602,51 @@ def _model_wave_ode(
     
     Notes
     -----
-    The equation is derived from the damped wave equation:
-    d^2 phi_j / dt^2 + 2 * gamma * d phi_j / dt + gamma^2 * (1 + r^2 * lambdaj) * phi_j = gamma^2 * qj 
+    The equation is derived from the damped wave equation for each mode j:
+    d^2(phi_j)/dt^2 + 2 * gamma * d(phi_j)/dt + gamma^2 * (1 + r^2 * eval_j) * phi_j = gamma^2 * q_j
     
     Rearranging gives us the first-order system
-        dx1/dt = x2
-        dx2/dt = -2 * gamma * x2 - gamma^2 * (1 + r^2 * lambdaj) * x1 + gamma^2 * qval
+        d(x1)/dt = x2
+        d(x2)/dt = -2 * gamma * x2 - gamma^2 * (1 + r^2 * eval_j) * x1 + gamma^2 * q_j
     """
     n_modes, nt = input_coeffs.shape
-    t = np.linspace(0, dt * (nt - 1), nt)
+    t_vec = np.linspace(0, dt * (nt - 1), nt)
     
-    # Simulate wave equation for each mode
-    mode_coeffs = np.empty_like(input_coeffs)
-    for j in range(n_modes):
-        def wave_odes_j(t_, y, j=j):
-            """Returns the wave ODEs for mode j."""
-            x1, x2 = y
+    # Create linear interpolator for input, as solver may need intermediate timepoints
+    input_interp = make_interp_spline(t_vec, input_coeffs, k=1, axis=1, check_finite=False)
 
-            # Interpolate input coefficient at time t_
-            qval = np.interp(t_, t, input_coeffs[j, :])
-            if isinstance(qval, np.ndarray):
-                qval = qval.item()
+    # Define ODE system, needed for solve_ivp
+    def wave_odes(t, y):
+        # Unpack y as a state vector of modes' activity (x1) and their derivatives (x2)
+        x1, x2 = np.split(y, 2)
+        
+        # Get inputs for all modes at time t
+        # If t is among the timepoints of interest (t_vec), this is simply input_coeffs[:, idx]
+        input = input_interp(t)
+        
+        # Calculate derivatives using the NFT wave equation
+        dx1dt = x2
+        dx2dt = -2 * gamma * x2 - gamma**2 * (1 + r**2 * evals) * x1 + gamma**2 * input
+        
+        # Return state vector derivative
+        return np.concatenate([dx1dt, dx2dt])
+        
+    # Set initial conditions: all modes begin at rest
+    y0 = np.zeros(2 * n_modes)
 
-            # Set expressions for time derivatives
-            dx1dt = x2
-            dx2dt = -2 * gamma * x2 - gamma**2 * (1 + r**2 * evals[j]) * x1 + gamma**2 * qval
-            return [dx1dt, dx2dt]
-
-        # Call ODE solver
-        sol = solve_ivp(
-            wave_odes_j,
-            t_span=(t[0], t[-1]),
-            y0=[0.0, 0.0],  # Initial condition: phi_j(0) = 0, dphi_j/dt(0) = 0
-            t_eval=t,
-            method='RK45',
-            rtol=1e-6,
-            atol=1e-9
-        )
-
-        mode_coeffs[j, :] = sol.y[0]  # Store phi_j(t)
-
-    return mode_coeffs
+    # Solve ODE system
+    sol = solve_ivp(
+        wave_odes,
+        t_span=(0, t_vec[-1]),
+        y0=y0,
+        t_eval=t_vec,
+        method='RK45',
+        rtol=1e-6,
+        atol=1e-9
+    )
+    
+    # Return activity without derivatives
+    return sol.y[:n_modes, :]
 
 def _model_wave_fem(
     input_w: NDArray[np.floating],
@@ -660,21 +675,20 @@ def _model_wave_fem(
     stiffness : scipy.sparse.csc_matrix
         The stiffness matrix of shape ``(n_verts, n_verts)``.
     dt : float, optional
-        Time step for the simulation in seconds. Default is ``1e-4``.
+        Time step for the simulation in seconds.
     r : float, optional
-        Spatial length scale of wave propagation in millimeters. Default is ``17.4``.
+        Spatial length scale of wave propagation in millimeters.
     gamma : float, optional
-        Damping rate of wave propagation in seconds^(-1). Default is ``116.0``.
+        Damping rate of wave propagation in seconds^(-1).
     padding_tol : float, optional
         Tolerance for Fourier wrap-around artifacts, between ``0`` and ``1``. Lower values increase
         the amount of zero-padding and thus the simulation time and memory usage. The number of
         padding timepoints is given by -ln(``padding_tol``)/(``gamma``*``dt``), meaning that a value
-        of ``1`` at t=0 wraps around to a value of ``padding_tol`` at t=nt-1. Default is ``1e-5``.
+        of ``1`` at t=0 wraps around to a value of ``padding_tol`` at t=nt-1.
     n_jobs : int, optional
-        Number of parallel jobs to run. If not ``1``, ``joblib`` must be installed. Default is
-        ``1``.
+        Number of parallel jobs to run. If not ``1``, ``joblib`` must be installed.
     verbose : int, optional
-        Verbosity level for parallel execution. Default is ``0``.
+        Verbosity level for parallel execution.
     """
     nt = input_w.shape[1]
 
@@ -687,16 +701,17 @@ def _model_wave_fem(
         n_pad = int(np.ceil(t_pad / dt))
     input_padded = np.pad(input_w, ((0, 0), (n_pad, 0)), constant_values=0)
 
-    # Apply Fourier transform to get frequency-domain representation of the causal signal.
-    input_padded_freqs = np.fft.rfft(input_padded, axis=1)
+    # Get frequencies
+    # Negative sign in front of omega matches the physics convention of e^(iwt)
+    omega = -2 * np.pi * scipy.fft.rfftfreq(nt+n_pad, dt)
 
     # Compute components of NFT operator
     spatial = r**2 * stiffness
-    # Negative sign in front of omega matches the physics convention of e^(iwt)
-    omega = -2 * np.pi * np.fft.rfftfreq(nt+n_pad, dt)
     temporal = -omega**2 / gamma**2 - 2j * omega / gamma + 1
 
-    # Main computation
+    # Apply Fourier transform to get frequency-domain representation of the causal signal.
+    input_padded_freqs = scipy.fft.rfft(input_padded, axis=1, overwrite_x=True, workers=n_jobs)
+
     # Compute activity at each frequency (TODO: consider memory usage, if fine then vectorise)
     eqns = (
         (spatial + temporal[k] * mass, input_padded_freqs[:, k])
@@ -705,7 +720,7 @@ def _model_wave_fem(
 
     # Define helper function for parallelization
     def _solve_fem_freq(operator, input):
-        return splu(operator).solve(input)  # cannot use Cholesky as operator is not always SPD
+        return splu(operator).solve(input)  # cannot use Cholesky decomposition is not always SPD
 
     phi_freqs = None # stops it being unbound and keeps pyright happy
     if n_jobs > 1 or n_jobs == -1:
@@ -719,7 +734,7 @@ def _model_wave_fem(
     phi_freqs = np.stack(cast(list[NDArray[np.complex128]], phi_freqs), axis=1)
 
     # Inverse transform to time domain
-    phi = np.fft.irfft(phi_freqs, axis=1, n=nt+n_pad)
+    phi = scipy.fft.irfft(phi_freqs, axis=1, n=nt+n_pad, overwrite_x=True, workers=n_jobs)
 
     # Return only the non-negative time part (t >= 0)
     return phi[:, n_pad:]
@@ -728,6 +743,7 @@ def _model_balloon_fourier(
     activity_coeffs: NDArray[np.floating],
     dt: float,
     padding_tol: float | Literal['nt'],
+    n_jobs: int,
     kappa: float = 0.65,
     tau: float = 0.98,
     alpha: float = 0.32,
@@ -755,7 +771,9 @@ def _model_balloon_fourier(
         the amount of zero-padding and thus the simulation time and memory usage. The number of
         padding timepoints is given by -ln(``padding_tol``)/(``dt`` * min(``kappa``/2, 1/``tau``,
         1/(``tau`` * ``alpha``))), meaning that a value of ``1`` at t=0 wraps around to a value of
-        approximately ``padding_tol`` at t=``nt``-1. Default is ``1e-5``.
+        approximately ``padding_tol`` at t=``nt``-1.
+    n_jobs : int, optional
+        Number of threads to use for speeding up computation.
     kappa : float, optional
         Signal decay rate in seconds^-1. Default is ``0.65``.
     tau : float, optional
@@ -785,9 +803,9 @@ def _model_balloon_fourier(
     -----
     This function uses a frequency-domain method to simulate the damped wave response of a causal 
     input. To ensure causality (i.e., the input is zero for t < 0), the input is zero-padded on the 
-    negative time axis and transformed using ``np.fft.rfft``, which mimics the forward Fourier
+    negative time axis and transformed using ``scipy.fft.rfft``, which mimics the forward Fourier
     transform of a causal signal. The system's frequency response (transfer function) is then
-    applied, and ``np.fft.irfft`` is used to return to the time domain. This approach is standard
+    applied, and ``scipy.fft.irfft`` is used to return to the time domain. This approach is standard
     for simulating linear time-invariant causal systems and is equivalent to convolution with a
     Green's function.
 
@@ -812,9 +830,11 @@ def _model_balloon_fourier(
         n_pad = int(np.ceil(t_pad / dt))
     activity_coeffs_padded = np.pad(activity_coeffs, ((0, 0), (n_pad, 0)), constant_values=0)
 
+    # Get frequencies
+    omega = -2 * np.pi * scipy.fft.rfftfreq(nt+n_pad, d=dt)
+
     # Calculate balloon model frequency response (Pang et al. 2016)
     # Negative sign in front of omega matches the physics convention of e^(iwt)
-    omega = -2 * np.pi * np.fft.rfftfreq(nt+n_pad, d=dt)
     beta = (rho + (1 - rho) * np.log(1 - rho)) / rho
     phi_hat_Fz = 1 / (-(omega + 1j * 0.5 * kappa) ** 2 + w_f ** 2)
     phi_hat_yF = V_0 * (alpha * (k2 + k3) * (1 - 1j * tau * omega) 
@@ -822,14 +842,13 @@ def _model_balloon_fourier(
                                 ) / ((1 - 1j * tau * omega) * (1 - 1j * tau * alpha * omega))
     balloon_freq_response = phi_hat_yF * phi_hat_Fz
 
-    # Apply Fourier transform (implemented as rfft for speed)
-    activity_coeffs_f = np.fft.rfft(activity_coeffs_padded, axis=1)
+    # Fourier transform, apply transfer function, and inverse transform back to time domain
+    activity_coeffs_f = scipy.fft.rfft(activity_coeffs_padded, axis=1, overwrite_x=True,
+                                       workers=n_jobs)
 
-    # Apply frequency response (broadcast along time axis)
     out_fft = balloon_freq_response[None, :] * activity_coeffs_f
 
-    # Inverse transform back to timeseries (inverse of previous transform)
-    out_full = np.fft.irfft(out_fft, n=nt+n_pad, axis=1)
+    out_full = scipy.fft.irfft(out_fft, n=nt+n_pad, axis=1, overwrite_x=True, workers=n_jobs)
 
     # Remove zero padding
     return out_full[:, n_pad:]
@@ -888,46 +907,52 @@ def _model_balloon_ode(
         If the ODE solver fails.
     """
     n_modes, nt = activity_coeffs.shape
-    t = np.linspace(0, dt * (nt - 1), nt)
+    t_vec = np.linspace(0, dt * (nt - 1), nt)
 
-    # Simulate balloon model for each mode
-    bold_coeffs = np.empty_like(activity_coeffs)
-    for j in range(n_modes):
-        def balloon_odes_j(t_, y, j=j):
-            """Returns the balloon model ODEs for mode j."""
-            z, f, v, q = y
+    # Create linear interpolator for activity, as solver may need intermediate timepoints
+    activity_interp = make_interp_spline(t_vec, activity_coeffs, k=1, axis=1, check_finite=False)
 
-            # Interpolate input coefficient at time t_
-            N = np.interp(t_, t, activity_coeffs[j])
+    # Define ODE system, needed for solve_ivp
+    def balloon_odes(t, y):
+        # Unpack y as a state vector of four components for each mode: [z, f, v, q]
+        z, f, v, q = np.split(y, 4)
 
-            # Set expressions for time derivatives
-            dzdt = N - kappa * z - gamma_h * (f - 1)
-            dfdt = z
-            dvdt = (f - v ** (1 / alpha)) / tau
-            dqdt = (f * (1 - (1 - rho) ** (1 / f)) / rho - q * v ** (1 / alpha - 1)) / tau
-            return [dzdt, dfdt, dvdt, dqdt]
+        # Get activity for all modes at time t
+        # If t is among the timepoints of interest (t_vec), this is simply activity_coeffs[:, idx]
+        activity = activity_interp(t)
+        
+        # Calculate derivatives
+        dzdt = activity - kappa * z - gamma_h * (f - 1)
+        dfdt = z
+        dvdt = (f - v ** (1 / alpha)) / tau
+        dqdt = (f * (1 - (1 - rho) ** (1 / f)) / rho - q * v ** (1 / alpha - 1)) / tau
 
-        # Call ODE solver
-        sol = solve_ivp(
-            balloon_odes_j,
-            t_span=(t[0], t[-1]),
-            y0=[0.0, 1.0, 1.0, 1.0], # Initial condition for [z, f, v, q]
-            t_eval=t,
-            method='RK45',
-            rtol=1e-6,
-            atol=1e-9
-        )
+        # Return state vector derivative
+        return np.concatenate([dzdt, dfdt, dvdt, dqdt])
+        
+    # Set initial conditions
+    y0 = np.zeros(4 * n_modes)
+    y0[n_modes:] = 1.0  # f, v, q start at 1
 
-        if not sol.success:
-            raise RuntimeError("Balloon model ODE solver failed. Try using method='fourier' or "
-                               "a smaller timestep (dt) without altering balloon model parameters. "
-                               f"scipy.integrate.solve_ivp message: {sol.message}")
+    # Solve ODE system
+    sol = solve_ivp(
+        balloon_odes,
+        t_span=(0, t_vec[-1]),
+        y0=y0,
+        t_eval=t_vec,
+        method='RK45',
+        rtol=1e-6,
+        atol=1e-9
+    )
+    
+    if not sol.success:
+        raise RuntimeError("Balloon model ODE solver failed. Try using method='fourier' or "
+                           "a smaller timestep (dt) without altering balloon model parameters. "
+                           f"scipy.integrate.solve_ivp message: {sol.message}")
 
-        # Apply standard BOLD signal equation
-        _, _, v, q = sol.y
-        bold_coeffs[j, :] = V_0 * (k1 * (1 - q) + k2 * (1 - q / v) + k3 * (1 - v))
-
-    return bold_coeffs
+    # Compute BOLD
+    _, _, v, q = np.split(sol.y, 4)
+    return V_0 * (k1 * (1 - q) + k2 * (1 - q / v) + k3 * (1 - v))
 
 def calc_nft_fc(
     emodes: NDArray[np.floating],
