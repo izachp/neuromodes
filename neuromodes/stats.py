@@ -492,7 +492,7 @@ def lstsqw(
 ) -> tuple[NDArray[np.floating], int, float, NDArray[np.floating]]:
     """
     Solve the linear system Ax = b, where A and b are sets of spatial maps, by minimising the
-    mass-weighted (squared) L2 norm (b-Ax)^T M (b-Ax) (see Notes).
+    mass-weighted (squared) L₂ norm (b-Ax)ᵀ M (b-Ax) (see Notes).
 
     Parameters
     ----------
@@ -516,19 +516,19 @@ def lstsqw(
 
     Notes
     -----
-    For discretized spatial maps, we want to minimize the mass-weighted L2 norm. By leveraging the
+    For discretized spatial maps, we want to minimize the mass-weighted L₂ norm. By leveraging the
     Cholesky decomposition of the symmetric positive definite mass matrix (M = L L^T), we can
     transform the mass-weighted norm into a typical Euclidean norm:
     
-    ||b-Ax||_(2,mass)^2 = (b-Ax)ᵀM(b-Ax)
-                        = (b-Ax)ᵀLLᵀ(b-Ax)
-                        = (Lᵀ(b-Ax))ᵀ(Lᵀ(b-Ax))
-                        = ((Lᵀb)-(LᵀA)x)ᵀ((Lᵀb)-(LᵀA)x)
-                        = ||(Lᵀb)-(LᵀA)x||_(2,Euclidean)^2
+    ||b-Ax||₂²_mass = (b-Ax)ᵀM(b-Ax)
+                    = (b-Ax)ᵀLLᵀ(b-Ax)
+                    = (Lᵀ(b-Ax))ᵀ(Lᵀ(b-Ax))
+                    = ((Lᵀb)-(LᵀA)x)ᵀ((Lᵀb)-(LᵀA)x)
+                    = ||(Lᵀb)-(LᵀA)x||₂²_Euclidean
     
     The above tells us that we can still use a standard least squares solver if we simply scale the
     data by Lᵀ. This is equivalent to using np.linalg.solve(a.T @ mass @ a, a.T @ mass @ b) but is
-    more efficient and numerically stable. Note that for lumped (diagonal) mass, L = Lᵀ = sqrt(M).
+    more efficient and numerically stable. Note that for lumped (diagonal) mass, L = Lᵀ = √M.
     """
     ved = EigenData(data=(data_a, data_b), mass=mass)
     a, b = ved.data
@@ -753,6 +753,11 @@ def _mult_by_cholesky(
     np.ndarray
         The input data multiplied by the Cholesky factor of the matrix, of shape ``(n_verts,
         n_maps)``.
+
+    Raises
+    ------
+    ValueError
+        If the matrix is not symmetric or not positive definite.
     """
     ved = EigenData(data=data, mass=matrix)  # a bit dodgy
     data, matrix = ved.data, ved.mass
@@ -769,26 +774,28 @@ def _mult_by_cholesky(
 
     # Manually permute rows/cols of matrix to reduce its bandwidth and thus increase sparsity of L
     # and U factors for efficiency. splu usually does this internally, but does not offer the option
-    # to ensure symmetric permutation, as is needed for L_lu U = L_lu D L_lu^T (see below).
+    # to ensure symmetric permutation, as is needed for L_lu U = L_lu D L_luᵀ (see below).
     perm = reverse_cuthill_mckee(matrix, symmetric_mode=True)
     matrix_perm = matrix[perm, :][:, perm]
 
     # Factorize, while forcing splu to avoid permuting and pivoting
-    # matrix = L_lu U = L_lu D L_lu^T = (L_lu √(D)) (L_lu √(D))^T = L L^T
+    # matrix = L_lu U = L_lu D L_luᵀ = (L_lu √D) (L_lu √D)ᵀ = L Lᵀ
     lu = splu(matrix_perm, permc_spec='NATURAL', diag_pivot_thresh=0)
     L_lu = lu.L.tocsr()
     D = lu.U.diagonal()[:, None]
 
     # Check that matrix is SPD (D must be positive)
+    # this is a necessary but not sufficient condition, but computationally easy
+    # TODO: consider more robust checks
     if np.any(D <= 0):
         raise ValueError("matrix is not positive definite.")
 
     # Scale permuted data
     if transpose:
-        # L.T = (L_lu √(D))^T = √(D) L_lu^T
+        # Lᵀ = (L_lu √D)ᵀ = √D L_luᵀ
         data_rescaled = np.sqrt(D) * (L_lu.T @ data[perm, :])
     else:
-        # L = L_lu √(D)
+        # L = L_lu √D
         data_rescaled = L_lu @ (np.sqrt(D) * data[perm, :])
 
     # Reverse the permutation

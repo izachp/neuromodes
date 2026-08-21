@@ -265,8 +265,7 @@ def sim_nft_waves(
     if method == 'fem':
         if mass is None or stiffness is None:
             raise ValueError("Mass and stiffness matrices must be provided when method is 'fem'.")
-        return _model_wave_fem(input_w, mass, stiffness, dt, r, gamma, padding_tol, n_jobs,
-                               verbose)
+        return _model_wave_fem(input_w, mass, stiffness, dt, r, gamma, padding_tol, n_jobs, verbose)
     
     # Standard modal implementation: pass decomposed input, then output reconstruction
     activity_coeffs = (_model_wave_fourier(input_coeffs, dt, r, gamma, evals, padding_tol, n_jobs)
@@ -301,9 +300,26 @@ def calc_nft_wave_speed(
     float or np.ndarray
         Wave speed across the whole cortex in meters per second, or at each vertex if ``hetero`` is
         provided.
+
+    Raises
+    ------
+    ValueError
+        If ``r`` is negative or ``gamma`` is non-positive.
+    ValueError
+        If ``hetero`` is provided and contains negative values.
     """
+    if r < 0:
+        raise ValueError("Parameter r must be non-negative.")
+    if gamma <= 0:
+        raise ValueError("Parameter gamma must be positive.")
+    
     speed = (r / 1000) * gamma # Convert r to meters
+
     if hetero is not None:
+        hetero = np.asarray(hetero)
+        if np.any(hetero < 0):
+            raise ValueError("Heterogeneity map must contain only non-negative values.")
+        
         speed *= np.sqrt(hetero)
 
     return speed
@@ -332,28 +348,42 @@ def calc_nft_mode_freqs(
     np.ndarray
         Damped frequencies of shape ``(n_modes,)``.
 
+    Raises
+    ------
+    ValueError
+        If ``r`` is negative or ``gamma`` is non-positive.
+
     Notes
     -----
-    NFT wave equation for mode j is given by
+    The NFT wave equation for mode j is given by
     
-        [1/gamma^2 d^2/dt^2 + 2/gamma d/dt + (1 + r^2 eval_j)] phi_j(t) = Q_j(t)
+        [1/γ² d²/dt² + 2/γ d/dt + (1 + r² λⱼ)] ϕⱼ(t) = qⱼ(t),
 
-    where phi_j(t) is the activity of mode j, eval_j is the eigenvalue of mode j, and Q_j(t) is
-    the external input. Mapping these to the classical driven harmonic oscillator equation, we have:
+    where ϕⱼ(t) is the activity of mode j, λⱼ is the eigenvalue of mode j, and qⱼ(t) is the external
+    input. Mapping these to the classical driven harmonic oscillator equation, we have:
 
-        m d^2/dt^2 phi_j(t) + c d/dt phi_j(t) + k phi_j(t) = Q_j(t)
-        m = 1/gamma^2, c = 2/gamma, k = 1 + r^2 eval_j
+        m d²/dt² ϕⱼ(t) = - k ϕⱼ(t) - c d/dt ϕⱼ(t) + qⱼ(t)
+        m = 1/γ², c = 2/γ, k = 1 + r²λⱼ
 
-    The damped angular frequency of mode j (omega_d_j) is then derived from the undamped angular
-    frequency (omega_u_j) and damping ratio (zeta_j) as:
+    The damped angular frequency of mode j (ω_dⱼ) is then derived from the undamped angular
+    frequency (ω_uⱼ) and damping ratio (ζⱼ) as:
     
-        omega_d_j = omega_u_j * √(1 - zeta_j^2)
-                  = √(k/m) * √(1 - (c/(2*√(k/m)))^2)
-                  = √(k/m - c^2/(4*m^2))
-                  = √((1 + r^2 eval_j) * gamma^2 - (2/gamma)^2 / (4 * (1/gamma^2)^2)
-                  = √((1 + r^2 eval_j) * gamma^2 - gamma^2)
-                  = gamma * √(r^2 eval_j)
+        ω_dⱼ = ω_uⱼ √(1 - ζⱼ²)
+             = √(k/m) √(1 - (c/(2√(k/m)))²)
+             = √(k/m - c²/(4m²))
+             = √((1 + r²λⱼ) γ² - (2/γ)² / (4(1/γ²)²)
+             = √((1 + r²λⱼ) γ² - γ²)
+             = γ √(r²λⱼ)
+
+    Also worth noting is that the damping ratio ζⱼ = c/(2√(k/m)) = 1/√(1 + r² λⱼ) < 1 for λⱼ > 0,
+    meaning all modes are underdamped except the first mode, which is critically damped (ζ₀ = 1).
     """
+    # Validate parameters
+    if r < 0:
+        raise ValueError("Parameter r must be non-negative.")
+    if gamma <= 0:
+        raise ValueError("Parameter gamma must be positive.")
+
     # Calculate and convert from rad/s to Hz
     return gamma * np.sqrt(r**2 * evals) / (2 * np.pi)
 
@@ -378,15 +408,39 @@ def calc_nft_fc(
     -------
     np.ndarray
         Analytical FC matrix of shape ``(n_verts, n_verts)``.
+
+    Notes
+    -----
+    Parseval's identity tells us that the variance of a signal in the time domain is equal to the
+    integral of its power spectral density in the frequency domain. For the wave model under a white
+    noise input q(t), it follows that the j-th mode's variance is given by
+
+        var(ϕⱼ(t)) = ∫ |Φⱼ(ω)|² dω
+                   = ∫ |Qⱼ(ω) Hⱼ(ω)|² dω
+                   = ∫ |Qⱼ(ω)|² |Hⱼ(ω)|² dω
+                   = ∫ |Hⱼ(ω)|² dω
+                   = ∫ 1 / |-(1/γ²) ω² - (2/γ) iω + (1 + r²λⱼ)|² dω
+                   = 1 / (2γ (1 + r²λⱼ)).
+
+    The variance-covariance matrix of the wave model can then be reconstructed in vertex space as
+
+        cov(ϕ(t)) = (1/n) ϕ(t) ϕ(t)ᵀ
+                  = (1/n) (Ψ ϕ_β(t)) (Ψ ϕ_β(t))ᵀ
+                  = Ψ (1/n) ϕ_β(t) ϕ_β(t)ᵀ Ψᵀ
+                  = Ψ cov(ϕ_β(t)) Ψᵀ
+                  = Ψ diag(var(ϕ_β(t))) Ψᵀ,
+
+    where Ψ is the eigenmodes matrix and ϕ_β(t) is the activity in modal space.
+
+    Finally, the correlation matrix is obtained by normalising the rows and columns of the
+    variance-covariance matrix by their respective standard deviations. This removes the scaling
+    factor of 1/(2γ) from the correlation matrix, meaning that the damping parameter γ has no effect
+    on the model FC.
     """
     ved = EigenData(emodes=emodes, evals=evals, checks=False)
     emodes, evals = ved.emodes, ved.evals
 
-    # Compute the variance of each mode's activity timeseries by applying Parseval's identity to the
-    # NFT operator. This is equivalent to integrating the power spectral density of each mode's
-    # response over all frequencies, which yields the variance of the mode's activity timeseries.
-    # NOTE: technically the denominator should be multiplied by 2*gamma, but we can ignore this here
-    # since correlation normalises this out later (i.e., gamma has no effect on model FC)
+    # compute mode variances, ignoring the 1/(2*gamma) factor
     mode_vars = 1.0 / (1 + r**2 * evals)
 
     # reconstruct (change from modal to vertex basis)
@@ -549,7 +603,7 @@ def _gen_noise(
     matrix. As such, spatial noise must account for this mass-weighting. This is achieved by
     leveraging the Cholesky decomposition of the symmetric positive definite mass matrix: M = LLᵀ,
     where L is lower triangular. By defining the mass-normalized noise as w = L⁻ᵀf, the expected
-    mean and variance are preserved independent of the mass matrix:
+    mean and variance remain independent of the mass matrix:
 
     E[μ(w)] = E[sum(Mw) / sum(M)]
             = E[1ᵀ(LLᵀ)(L⁻ᵀf) / (1ᵀM1)]
@@ -557,15 +611,15 @@ def _gen_noise(
             = (1ᵀL0) / (1ᵀM1)
             = 0
 
-    E[σ^2(w)] = E[(w-μ(w))ᵀM(w-μ(w))]
-              = E[wᵀMw - wᵀMμ(w) - μ(w)ᵀMw + μ(w)ᵀMμ(w)]
-              = E[wᵀMw] - E[wᵀMμ(w)] - E[μ(w)ᵀMw] + E[μ(w)ᵀMμ(w)]
-              = E[(L⁻ᵀf)ᵀ(LLᵀ)(L⁻ᵀf)] - E[wᵀ]ME[μ(w)] - E[μ(w)]ᵀME[w] + E[μ(w)ᵀ]ME[μ(w)]
-              = E[fᵀ(L⁻¹LLᵀL⁻ᵀ)f] - 0 - 0 + 0 
-              = E[fᵀf]
-              = E[sum_i^n(f_i^2)]
-              = nE[f_i^2]
-              = n
+    E[σ²(w)] = E[(w-μ(w))ᵀM(w-μ(w))]
+             = E[wᵀMw - wᵀMμ(w) - μ(w)ᵀMw + μ(w)ᵀMμ(w)]
+             = E[wᵀMw] - E[wᵀMμ(w)] - E[μ(w)ᵀMw] + E[μ(w)ᵀMμ(w)]
+             = E[(L⁻ᵀf)ᵀ(LLᵀ)(L⁻ᵀf)] - E[wᵀ]ME[μ(w)] - E[μ(w)]ᵀME[w] + E[μ(w)ᵀ]ME[μ(w)]
+             = E[fᵀ(L⁻¹LLᵀL⁻ᵀ)f] - 0 - 0 + 0 
+             = E[fᵀf]
+             = E[∑ᵢⁿ(fᵢ²)]
+             = nE[fᵢ²]
+             = n
     
     However, since the weak form PDE of the NFT wave model's FEM solver needs mass-weighting, we can
     pre-factor this into our noise generation:
@@ -576,9 +630,8 @@ def _gen_noise(
 
     This lets us use a simple sparse multiplication instead of obtaining w = L⁻ᵀf via the slower and
     less numerically stable ``scipy.sparse.linalg.spsolve_triangular(L.T, f)``. Note that for lumped
-    (diagonal) mass, L = Lᵀ = sqrt(M).
+    (diagonal) mass, L = Lᵀ = √M.
     """
-
     # Draw samples from N(0, 1) in column-major order to ensure reproducibility across nt, then
     # transpose to desired shape (n_samples, nt)
     rng = np.random.default_rng(seed)
@@ -678,7 +731,7 @@ def _model_wave_ode(
     Parameters
     ----------
     input_coeffs : np.ndarray
-        Input drive to the system with shape ``(n_modes, nt)`` (written as q_j in equation below).
+        Input drive to the system with shape ``(n_modes, nt)`` (written as qⱼ in equation below).
     dt : float
         Time step for the simulation in seconds.
     gamma : float
@@ -691,16 +744,17 @@ def _model_wave_ode(
     Returns
     -------
     np.ndarray
-        Time evolution of phi_j(t), solution to the wave equation, with shape ``(n_modes, nt)``.
+        Time evolution of ϕⱼ(t), solution to the wave equation, with shape ``(n_modes, nt)``.
     
     Notes
     -----
     The equation is derived from the damped wave equation for each mode j:
-    d^2(phi_j)/dt^2 + 2 * gamma * d(phi_j)/dt + gamma^2 * (1 + r^2 * eval_j) * phi_j = gamma^2 * q_j
+    
+       (1/γ²) d²(ϕⱼ)/dt² + (2/γ) d(ϕⱼ)/dt + (1 + r²λⱼ) ϕⱼ = qⱼ
     
     Rearranging gives us the first-order system
-        d(x1)/dt = x2
-        d(x2)/dt = -2 * gamma * x2 - gamma^2 * (1 + r^2 * eval_j) * x1 + gamma^2 * q_j
+        d(x₁)/dt = x₂
+        d(x₂)/dt = -2γ x₂ - γ²(1 + r²λⱼ) x₁ + γ²qⱼ
     """
     n_modes, nt = input_coeffs.shape
     t_vec = np.linspace(0, dt * (nt - 1), nt)
@@ -919,9 +973,10 @@ def _model_balloon_fourier(
     # Negative sign in front of omega matches the physics convention of e^(iwt)
     beta = (rho + (1 - rho) * np.log(1 - rho)) / rho
     phi_hat_Fz = 1 / (-(omega + 1j * 0.5 * kappa) ** 2 + w_f ** 2)
-    phi_hat_yF = V_0 * (alpha * (k2 + k3) * (1 - 1j * tau * omega) 
-                                - (k1 + k2) * (alpha + beta - 1 - 1j * tau * alpha * beta * omega)
-                                ) / ((1 - 1j * tau * omega) * (1 - 1j * tau * alpha * omega))
+    phi_hat_yF = V_0 * (
+        alpha * (k2 + k3) * (1 - 1j * tau * omega) 
+        - (k1 + k2) * (alpha + beta - 1 - 1j * tau * alpha * beta * omega)
+        ) / ((1 - 1j * tau * omega) * (1 - 1j * tau * alpha * omega))
     balloon_freq_response = phi_hat_yF * phi_hat_Fz
 
     # Fourier transform, apply transfer function, and inverse transform back to time domain
@@ -1028,8 +1083,8 @@ def _model_balloon_ode(
     )
     
     if not sol.success:
-        raise RuntimeError("Balloon model ODE solver failed. Try using method='fourier' or "
-                           "a smaller timestep (dt) without altering balloon model parameters. "
+        raise RuntimeError("Balloon model ODE solver failed. Try using method='fourier' or a "
+                           "smaller timestep (dt) without altering balloon model parameters. "
                            f"scipy.integrate.solve_ivp message: {sol.message}")
 
     # Compute BOLD
