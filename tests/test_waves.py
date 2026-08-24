@@ -252,11 +252,54 @@ def test_calc_nft_wave_speed(solver):
     assert speed.shape == (solver.n_verts,), "Output shape is incorrect when using hetero." # type: ignore
 
 def test_calc_nft_mode_freqs(solver):
-    freqs = calc_nft_mode_freqs(solver.evals, r=18.0, gamma=116)
-    assert np.all(freqs[1:] > 0), "Output contains non-positive frequencies past mode 0."
-    assert freqs.shape == (solver.n_modes,), "Output shape is incorrect when using hetero."
-    assert np.all(np.diff(freqs) > 0), "Output frequencies are not increasing."
-    assert freqs[0] == 0, "Output frequency for mode 0 is not 0."
+    # This test is similar to what's in docs/validation/waves_mode_freqs.ipynb
+
+    # Set parameters (these are a bit p-hacked to ensure that there's enough oscillatory activity
+    # for FFT to detect the correct frequency)
+    r = 100
+    gamma = 10
+    dt = 1e-3  # s
+    t = 2.0  # s
+    nt = round(t / dt)
+    t0 = nt // 2
+
+    # Set each mode's input to 1 from 0 to t0
+    ext_input = np.zeros((solver.n_verts, nt))
+    ext_input[:, :t0] = solver.emodes.sum(axis=1)[:, None]
+
+    # Simulate waves using ODE method to avoid potential circularity
+    sim_ts = solver.sim_nft_waves(dt=dt, r=r, gamma=gamma, ext_input=ext_input, method='ode')
+
+    # Decompose timeseries into modal basis
+    modes_ts = solver.decompose(sim_ts)
+
+    # Check that system reaches theoretical steady state by t0
+    steady_state = 1 / (1 + r**2 * solver.evals)
+    np.testing.assert_allclose(
+        modes_ts[:, t0-1],
+        steady_state,
+        rtol=0.05,
+        err_msg="System does not reach theoretical steady state by t0"
+        )
+
+    # Get power spectrum of latter half of modes' timeseries via FFT
+    modes_fft = np.abs(np.fft.rfft(modes_ts[:, t0:], axis=1))**2
+    freqs_fft = np.fft.rfftfreq(t0, dt)
+
+    # Get each mode's highest-power frequency from FFT of simulated activity
+    freqs_detected = freqs_fft[np.argmax(modes_fft, axis=1)]
+
+    # Get theoretical frequencies
+    freqs_theo = calc_nft_mode_freqs(solver.evals, r=r, gamma=gamma)
+
+    # Check that each mode's detected frequency is within 1 FFT bin of its theoretical frequency
+    bin_width = freqs_fft[1] - freqs_fft[0]
+    np.testing.assert_allclose(
+        freqs_detected,
+        freqs_theo,
+        atol=bin_width,
+        err_msg="Detected frequencies do not match theoretical frequencies within 1 FFT bin"
+        )
 
 def test_calc_nft_fc(solver):  
     sim_ts = solver.sim_nft_waves(nt=5000, dt=0.01, seed=0)

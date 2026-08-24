@@ -373,10 +373,11 @@ def calc_nft_mode_freqs(
              = √(k/m - c²/(4m²))
              = √((1 + r²λⱼ) γ² - (2/γ)² / (4(1/γ²)²)
              = √((1 + r²λⱼ) γ² - γ²)
-             = γ √(r²λⱼ)
+             = rγ √λⱼ
 
-    Also worth noting is that the damping ratio ζⱼ = c/(2√(k/m)) = 1/√(1 + r² λⱼ) < 1 for λⱼ > 0,
-    meaning all modes are underdamped except the first mode, which is critically damped (ζ₀ = 1).
+    Angular frequency is converted to Hz by dividing by 2π. Also worth noting is that the damping
+    ratio ζⱼ = c/(2√(k/m)) = 1/√(1 + r²λⱼ) < 1 for λⱼ > 0, meaning all modes are underdamped except
+    the first mode, which is critically damped (ζ₀ = 1).
     """
     # Validate parameters
     if r < 0:
@@ -385,7 +386,7 @@ def calc_nft_mode_freqs(
         raise ValueError("Parameter gamma must be positive.")
 
     # Calculate and convert from rad/s to Hz
-    return gamma * np.sqrt(r**2 * evals) / (2 * np.pi)
+    return r * gamma * np.sqrt(evals) / (2 * np.pi)
 
 def calc_nft_fc(
     emodes: NDArray[np.floating],
