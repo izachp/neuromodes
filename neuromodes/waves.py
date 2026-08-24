@@ -257,7 +257,6 @@ def sim_nft_waves(
             input_w = np.asarray(gen_noise(n_verts, nt, seed=seed, sample='vertices', mass=mass))
         else:
             # Generate white noise in modal space for computational efficiency
-            # FIXME: if hetero is provided, this is no longer white noise in vertex space
             input_coeffs = np.asarray(gen_noise(n_modes, nt, seed=seed))
     else: # not the nicest, but it makes pyright the happiest
         raise ValueError("Either nt or ext_input must be provided.")
