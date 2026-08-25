@@ -291,9 +291,10 @@ def calc_nft_wave_speed(
     gamma : float
         Damping parameter for wave propagation in seconds^-1.
     hetero : array-like, optional
-        Scaled heterogeneity map of shape (n_verts,). If ``None``, wave speed is assumed to be
-        spatially uniform. To scale a heterogeneity map, use :func:eigen.scale_hetero. Default is
-        ``None``.
+        Non-negative heterogeneity map of shape (n_verts,). If ``None`` (or all ones), speed is
+        taken as spatially uniform. In line with prior work [1]_, it is recommended that ``hetero``
+        is in the range [0, 2] (see rescaling functions :func:`~neuromodes.stats.zscorew` and
+        :func:`~neuromodes.stats.sigmoid_rescale`). Default is ``None``.
     
     Returns
     -------
@@ -307,6 +308,12 @@ def calc_nft_wave_speed(
         If ``r`` is negative or ``gamma`` is non-positive.
     ValueError
         If ``hetero`` is provided and contains negative values.
+
+    References
+    ----------
+    ..  [1] Barnes, V., et al. (2026). Regional heterogeneity shapes macroscopic wave dynamics
+        of the human and non-human primate cortex, bioRxiv.
+        https://doi.org/10.64898/2026.01.22.701178
     """
     if r < 0:
         raise ValueError("Parameter r must be non-negative.")
@@ -459,8 +466,8 @@ def balloon_model(
     tau: float = 0.98,
     alpha: float = 0.32,
     rho: float = 0.34,
-    V_0: float = 0.02,
     gamma_h: float = 0.41,
+    V_0: float = 0.02,
     k1: float = 3.72,
     k2: float = 0.527,
     k3: float = 0.48,
@@ -483,27 +490,42 @@ def balloon_model(
         vertices and ``n_modes`` is the number of eigenmodes.
     dt : float, optional
         Time step of simulated activity in seconds.
+    kappa : float, optional
+        Signal decay rate in seconds^-1.
+    tau : float, optional
+        Hemodynamic transit time in seconds.
+    alpha : float, optional
+        Grubb's exponent (unitless).
+    rho : float, optional
+        Resting oxygen extraction fraction (unitless).
+    gamma_h : float, optional
+        Hemodynamic gain (unitless).
+    V_0 : float, optional
+        Resting blood volume fraction (unitless).
+    k1 : float, optional
+        First coefficient in BOLD signal equation (unitless).
+    k2 : float, optional
+        Second coefficient in BOLD signal equation (unitless).
+    k3 : float, optional
+        Third coefficient in BOLD signal equation (unitless).
     method : str, optional
         Method for solving the balloon PDEs. Either ``'fourier'`` or ``'ode'``. Note that
         ``'fourier'`` relies on a first-order approximation of the nonlinear ODE system. Default is
         ``'fourier'``.
-    mass : array-like, optional
-        The mass matrix of shape (n_verts, n_verts), used for the decomposition of activity. Default
-        is ``None``, which uses the identity matrix.
     padding_tol : float, optional
         Tolerance for Fourier wrap-around artifacts, between ``0`` and ``1``. Lower values increase
         the amount of zero-padding and thus the simulation time and memory usage. The number of
         padding timepoints is given by -ln(``padding_tol``)/(``dt`` * min(``kappa``/2, 1/``tau``,
         1/(``tau`` * ``alpha``))), meaning that a value of ``1`` at t=0 wraps around to a value of
         approximately ``padding_tol`` at t=``nt``-1. Default is ``1e-5``.
+    mass : array-like, optional
+        The mass matrix of shape (n_verts, n_verts), used for the decomposition of activity. Default
+        is ``None``, which uses the identity matrix.
+    checks : bool, optional
+        Whether to perform checks on the input arrays. Default is ``True``.
     n_jobs : int, optional
         Number of threads to use for speeding up computation when ``method`` is ``'fourier'``.
         Default is ``1``.
-    checks : bool, optional
-        Whether to perform checks on the input arrays. Default is ``True``.
-    **params
-        Optional balloon model parameters to override defaults (e.g., ``rho``, ``k1``). See
-        :func:`_model_balloon_fourier` or :func:`_model_balloon_ode` for available parameters.
 
     Returns
     -------
@@ -542,7 +564,7 @@ def balloon_model(
         if not isinstance(param_value, (int, float)) or param_value <= 0:
             raise ValueError(f"Parameter '{param_name}' must be a positive number.")
 
-    # check that dt is sufficiently small to capture frequency
+    # check that dt is sufficiently small to capture frequency of blood flow response
     w_f = np.sqrt(gamma_h - kappa**2/4) / (2 * np.pi)  # Hz
     if w_f >= 1 / (2 * dt):
         dt_nyquist = 1 / (2 * w_f)
@@ -631,7 +653,7 @@ def _gen_noise(
 
     This lets us use a simple sparse multiplication instead of obtaining w = L⁻ᵀf via the slower and
     less numerically stable ``scipy.sparse.linalg.spsolve_triangular(L.T, f)``. Note that for lumped
-    (diagonal) mass, L = Lᵀ = √M.
+    (diagonal) mass, L = Lᵀ = √M (element-wise).
     """
     # Draw samples from N(0, 1) in column-major order to ensure reproducibility across nt, then
     # transpose to desired shape (n_samples, nt)
@@ -760,11 +782,13 @@ def _model_wave_ode(
     n_modes, nt = input_coeffs.shape
     t_vec = np.linspace(0, dt * (nt - 1), nt)
     
-    # Create interpolator for input, as solver may need intermediate timepoints
-    # Linear interpolation creates sharp corners and thus numerical instabilities in the solver
-    # Cubic splining is better but can overshoot/undershoot and create preceding inputs
-    # PCHIP is smooth and monotonic
-    # Another option is sinc interpolation, which bandlimits and thus matches the Fourier method
+    # Create interpolator for input, as solver may need intermediate timepoints.
+    # Linear interpolation creates sharp corners, leading to high-frequency artefacts and numerical
+    # instabilities in the solver.
+    # Cubic splining is better but can overshoot/undershoot and create phantom preceding inputs.
+    # Piecewise Cubic Hermite Interpolating Polynomials (PCHIPs) are smooth and monotonic.
+    # Another option is sinc interpolation, which bandlimits and thus matches the Fourier method,
+    # but this is demanding on time/memory and not implemented by numpy/scipy.
     input_interp = PchipInterpolator(t_vec, input_coeffs, axis=1, extrapolate=False)
 
     # Define ODE system, needed for solve_ivp
@@ -826,20 +850,20 @@ def _model_wave_fem(
         The mass matrix of shape ``(n_verts, n_verts)``.
     stiffness : scipy.sparse.csc_matrix
         The stiffness matrix of shape ``(n_verts, n_verts)``.
-    dt : float, optional
+    dt : float
         Time step for the simulation in seconds.
-    r : float, optional
+    r : float
         Spatial length scale of wave propagation in millimeters.
-    gamma : float, optional
+    gamma : float
         Damping rate of wave propagation in seconds^(-1).
-    padding_tol : float, optional
+    padding_tol : float
         Tolerance for Fourier wrap-around artifacts, between ``0`` and ``1``. Lower values increase
         the amount of zero-padding and thus the simulation time and memory usage. The number of
         padding timepoints is given by -ln(``padding_tol``)/(``gamma``*``dt``), meaning that a value
         of ``1`` at t=0 wraps around to a value of ``padding_tol`` at t=nt-1.
-    n_jobs : int, optional
+    n_jobs : int
         Number of parallel jobs to run. If not ``1``, ``joblib`` must be installed.
-    verbose : int, optional
+    verbose : int
         Verbosity level for parallel execution.
     """
     nt = input_w.shape[1]
@@ -918,32 +942,32 @@ def _model_balloon_fourier(
         nt).
     dt : float
         Time step in seconds.
-    padding_tol : float, optional
+    padding_tol : float
         Tolerance for Fourier wrap-around artifacts, between ``0`` and ``1``. Lower values increase
         the amount of zero-padding and thus the simulation time and memory usage. The number of
         padding timepoints is given by -ln(``padding_tol``)/(``dt`` * min(``kappa``/2, 1/``tau``,
         1/(``tau`` * ``alpha``))), meaning that a value of ``1`` at t=0 wraps around to a value of
         approximately ``padding_tol`` at t=``nt``-1. For more details, see
         https://github.com/NSBLab/neuromodes/blob/main/docs/validation/waves_fourier_padding.ipynb.
-    n_jobs : int, optional
+    n_jobs : int
         Number of threads to use for speeding up computation.
-    kappa : float, optional
+    kappa : float
         Signal decay rate in seconds^-1.
-    tau : float, optional
+    tau : float
         Hemodynamic transit time in seconds.
-    alpha : float, optional
+    alpha : float
         Grubb's exponent (unitless).
-    rho : float, optional
+    rho : float
         Resting oxygen extraction fraction (unitless).
-    V_0 : float, optional
+    V_0 : float
         Resting blood volume fraction (unitless).
-    w_f : float, optional
+    w_f : float
         Frequency of blood flow response in radians per second.
-    k1 : float, optional
+    k1 : float
         First coefficient in BOLD signal equation (unitless).
-    k2 : float, optional
+    k2 : float
         Second coefficient in BOLD signal equation (unitless).
-    k3 : float, optional
+    k3 : float
         Third coefficient in BOLD signal equation (unitless).
 
     Returns
@@ -1016,21 +1040,23 @@ def _model_balloon_ode(
         ``(n_modes, nt)``.
     dt : float
         Time step for the simulation in seconds.
-    kappa : float, optional
+    kappa : float
         Signal decay rate in seconds^-1.
-    tau : float, optional
+    tau : float
         Hemodynamic transit time in seconds.
-    alpha : float, optional
+    alpha : float
         Grubb's exponent (unitless).
-    V_0 : float, optional
+    rho : float
+        Resting oxygen extraction fraction (unitless).
+    V_0 : float
         Resting blood volume fraction (unitless).
-    gamma_h : float, optional
+    gamma_h : float
         Hemodynamic gain (unitless).
-    k1 : float, optional
+    k1 : float
         First coefficient in BOLD signal equation (unitless).
-    k2 : float, optional
+    k2 : float
         Second coefficient in BOLD signal equation (unitless).
-    k3 : float, optional
+    k3 : float
         Third coefficient in BOLD signal equation (unitless).
 
     Returns

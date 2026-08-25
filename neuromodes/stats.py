@@ -492,7 +492,7 @@ def lstsqw(
 ) -> tuple[NDArray[np.floating], int, float, NDArray[np.floating]]:
     """
     Solve the linear system Ax = b, where A and b are sets of spatial maps, by minimising the
-    mass-weighted (squared) L₂ norm (b-Ax)ᵀ M (b-Ax) (see Notes).
+    mass-weighted squared L₂ norm (b-Ax)ᵀ M (b-Ax) (see Notes).
 
     Parameters
     ----------
@@ -517,7 +517,7 @@ def lstsqw(
     Notes
     -----
     For discretized spatial maps, we want to minimize the mass-weighted L₂ norm. By leveraging the
-    Cholesky decomposition of the symmetric positive definite mass matrix (M = L L^T), we can
+    Cholesky decomposition of the symmetric positive definite mass matrix (M = LLᵀ), we can
     transform the mass-weighted norm into a typical Euclidean norm:
     
     ||b-Ax||₂²_mass = (b-Ax)ᵀM(b-Ax)
@@ -527,8 +527,9 @@ def lstsqw(
                     = ||(Lᵀb)-(LᵀA)x||₂²_Euclidean
     
     The above tells us that we can still use a standard least squares solver if we simply scale the
-    data by Lᵀ. This is equivalent to using np.linalg.solve(a.T @ mass @ a, a.T @ mass @ b) but is
-    more efficient and numerically stable. Note that for lumped (diagonal) mass, L = Lᵀ = √M.
+    data by Lᵀ. This is equivalent to using ``np.linalg.solve(a.T @ mass @ a, a.T @ mass @ b)`` but
+    is more efficient and numerically stable. Note that for lumped (diagonal) mass, L = Lᵀ = √M
+    (element-wise).
     """
     ved = EigenData(data=(data_a, data_b), mass=mass)
     a, b = ved.data
@@ -734,10 +735,9 @@ def _mult_by_cholesky(
     transpose: bool = False
 ) -> NDArray[np.floating]:
     """
-    Multiplies the input data by the Cholesky factor ``L`` (or its transpose ``L.T``) of the given
-    matrix (i.e., ``matrix`` = ``L @ L.T``). If the matrix is diagonal, ``L`` = ``L.T`` =
-    ``√(matrix)``. Note that ``matrix`` must be symmetric positive definite for the Cholesky
-    factorization to exist.
+    Multiplies the input data by the Cholesky factor L (or its transpose Lᵀ) of the given matrix
+    (i.e., matrix = LLᵀ). If the matrix is diagonal, L = Lᵀ = √(matrix) (element-wise). Note that
+    ``matrix`` must be symmetric positive definite for the Cholesky factorization to exist.
 
     Parameters
     ----------
@@ -767,7 +767,7 @@ def _mult_by_cholesky(
         raise ValueError("matrix is not symmetric.")
 
     if matrix.nnz == matrix.shape[0]:
-        # Diagonal matrix; L = L^T = √(matrix)
+        # Diagonal matrix; L = Lᵀ = √(matrix)
         return data * np.sqrt(matrix.diagonal())[:, None]
 
     # Non-diagonal matrix; compute Cholesky factorization via LU decomposition.
