@@ -552,7 +552,8 @@ def parcellate(
     data: NDArray[np.floating],
     parcellation: NDArray[np.integer],
     mass: spmatrix | NDArray[np.floating] | None,
-    method: Literal['mean', 'sum'] = 'mean'
+    method: Literal['mean', 'sum', 'var'] = 'mean',
+    checks: bool = True
 ) -> NDArray[np.floating]:
     """
     Area-weighted parcellation of each brain map.
@@ -566,10 +567,13 @@ def parcellate(
         the parcel ID for the corresponding vertex.
     mass : array-like
         The mass matrix, of shape ``(n_verts, n_verts)``.
-    method : {'mean', 'sum'}, optional
+    method : {'mean', 'sum', 'var'}, optional
         The method for aggregating vertex values within each parcel. If 'mean', the function
         computes the area-weighted mean of each parcel. If 'sum', the function computes the
-        area-weighted sum of each parcel. Default is 'mean'.
+        area-weighted sum of each parcel. If 'var', the function computes the area-weighted
+        variance of each parcel. Default is 'mean'.
+    checks : bool, optional
+        If True, the function will perform input validation and formatting. Default is True.
 
     Returns
     -------
@@ -579,17 +583,17 @@ def parcellate(
     Raises
     ------
     ValueError
-        If ``method`` is not 'mean' or 'sum'.
+        If ``method`` is not 'mean', 'sum', or 'var'.
     ValueError
         If ``data`` is not 1D or 2D.
     ValueError
         If ``parcellation`` is not 1D.
     """
     # Format / validate arguments
-    if method not in ('mean', 'sum'):
-        raise ValueError(f"method must be 'mean' or 'sum'; got {method}.")
+    if method not in ['mean', 'sum', 'var']:
+        raise ValueError(f"method must be 'mean', 'sum', or 'var'; got {method}.")
     
-    ved = EigenData(data=(data, parcellation), mass=mass)
+    ved = EigenData(data=(data, parcellation), mass=mass, checks=checks)
     data, parcellation = ved.data
     n_verts = data.shape[0]
     areas = _mass_to_areas(ved.mass, n_verts)
@@ -600,8 +604,7 @@ def parcellate(
     if parcellation.ndim != 1:
         raise ValueError("Parcellation map must be 1D.")
     
-    parc_ids = np.unique(parcellation)
-    n_parcels = len(parc_ids)
+    n_parcels = len(np.unique(parcellation))
     is_data_vec = (data.ndim == 1)
     data_2d = data[:, np.newaxis] if is_data_vec else data
 
@@ -613,14 +616,69 @@ def parcellate(
         )
 
     # Adjust parcellation matrix for vertex areas
-    parc_areas = parc_mat @ areas
+    parcel_areas = parc_mat @ areas
     parc_mat = parc_mat.multiply(areas)
-    if method == 'mean':
-        parc_mat /= parc_areas[:, np.newaxis]
+    if method in ['mean', 'var']:
+        parc_mat /= parcel_areas[:, np.newaxis]
 
     # Apply parcellation matrix to data
     data_parc = parc_mat @ data_2d
+
+    if method == 'var':
+        # Use expectation formula: var = E[X^2] - (E[X])^2
+        data_parc = parc_mat @ (data_2d ** 2) - data_parc ** 2
+
+        # Remove numerical error
+        data_parc = np.maximum(data_parc, 0)
+
     return data_parc.squeeze(axis=1) if is_data_vec else data_parc
+
+def calc_homogeneity(
+    data: NDArray[np.floating],
+    parcellation: NDArray[np.integer],
+    mass: spmatrix | NDArray[np.floating] | None
+) -> NDArray[np.floating]:
+    """
+    Calculates the parcel homogeneity of each brain map, defined as the average variance of each
+    parcel weighted by the area of each parcel.
+
+    Parameters
+    ----------
+    data : array-like
+        The spatial maps, of shape ``(n_verts, n_maps)``.
+    parcellation : array-like
+        The parcellation map, of shape ``(n_verts,)``, where each value is an integer representing
+        the parcel ID for the corresponding vertex.
+    mass : array-like
+        The mass matrix, of shape ``(n_verts, n_verts)``.
+
+    Returns
+    -------
+    np.ndarray
+        The parcel homogeneity of shape ``(n_maps,)``.
+    """
+    # Format / validate arguments
+    ved = EigenData(data=(data, parcellation), mass=mass)
+    data, parcellation = ved.data
+
+    areas = _mass_to_areas(ved.mass, data.shape[0])
+    n_verts = data.shape[0]
+    n_parcels = len(np.unique(parcellation))
+
+    # Get variance of each parcel
+    var_parc = parcellate(data, parcellation, mass=ved.mass, method='var', checks=False)
+
+    # Get parcel areas for weighting
+    parc_mat = csr_matrix(  # a bit inefficient, could create a helper func
+        (np.ones(n_verts),
+         (parcellation, np.arange(n_verts))),
+        shape=(n_parcels, n_verts)
+    )
+    parcel_areas = parc_mat @ areas
+
+    # Calculate weighted average of parcel variances
+    homogeneity = np.average(var_parc, axis=0, weights=parcel_areas)
+    return homogeneity.squeeze(axis=0) if data.ndim == 1 else homogeneity
 
 def sigmoid_rescale(
     data: NDArray[np.floating],
