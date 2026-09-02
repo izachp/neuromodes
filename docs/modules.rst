@@ -139,6 +139,8 @@ API Reference
    solvew
    lstsqw
    parcellate
+   calc_homogeneity
+   resample
    sigmoid_rescale
 
 .. _ref_mesh:

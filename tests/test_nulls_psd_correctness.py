@@ -16,8 +16,7 @@ def solver():
     mesh, _ = fetch_example_surf(density=density, hemi=hemi, surf_type='sphere')
     return EigenSolver(mesh).solve(n_modes=n_modes)
 
-# These are the main parameters which will exactly preserve PSD. For example, `resample='exact'`
-# will not.
+# These are the main parameters which will exactly preserve PSD.
 @pytest.mark.parametrize("rotation_method", ['scipy', 'qr'])
 @pytest.mark.parametrize("randomize", [True, False])
 @pytest.mark.parametrize("decomp_method", ['project', 'regress'])
