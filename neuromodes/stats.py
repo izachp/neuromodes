@@ -11,6 +11,7 @@ from typing import Literal, TYPE_CHECKING
 from warnings import warn
 from scipy.spatial.distance import squareform, cdist
 from scipy.sparse import csc_matrix, csr_matrix, spmatrix, diags
+from scipy.stats import norm
 from neuromodes.eigen import EigenData
 
 if TYPE_CHECKING:
@@ -683,7 +684,7 @@ def calc_homogeneity(
 def resample(
     data_a: NDArray[np.floating],
     data_b: NDArray[np.floating],
-    method: Literal['exact', 'mean', 'range', 'affine'] = 'exact',
+    method: Literal['exact', 'mean', 'range', 'affine', 'qnorm'] = 'exact',
     mass: spmatrix | NDArray[np.floating] | None = None
 ) -> NDArray[np.floating]:
     """
@@ -699,13 +700,15 @@ def resample(
     data_b : array-like
         The set of spatial maps to match against, of shape ``(n_verts,)`` or ``(n_verts,
         n_maps_b)``.
-    method : {'exact', 'mean', 'range', 'affine'}, optional
+    method : {'exact', 'mean', 'range', 'affine', 'qnorm'}, optional
         The resampling method to use.
         - ``'exact'``: Rank-matches ``data_a`` to preserve the exact distribution of ``data_b``.
         - ``'mean'``: Adjusts the mean of ``data_a`` to match that of ``data_b``.
         - ``'range'``: Adjusts the range of ``data_a`` to match that of ``data_b``.
         - ``'affine'``: Adjusts both the mean and standard deviation of ``data_a`` to match those of
         ``data_b``.
+        - ``'qnorm'``: Transforms ``data_a`` to a Gaussian distribution with the same mean and
+        standard deviation as ``data_b`` (quantile normalization).
     mass : array-like, optional
         The mass matrix, of shape ``(n_verts, n_verts)``.
 
@@ -713,7 +716,17 @@ def resample(
     -------
     ndarray
         The resampled data, of shape ``(n_verts,)`` or ``(n_verts, ..., n_maps_b)``.
+
+    Raises
+    ------
+    ValueError
+        If ``method`` is not one of the specified options.
+    ValueError
+        If ``data_b`` is 2D and its last axis length does not match that of ``data_a``.
+    ValueError
+        If ``data_b`` is not 1D or 2D.
     """
+    # TODO: consider making data_b optional and add parameters for mean / std / min / max
     # Format / validate arguments
     ved = EigenData(data=(data_a, data_b), mass=mass)
     data_a, data_b = ved.data[0].copy(), ved.data[1].copy()  # a bit ugly
@@ -741,7 +754,8 @@ def resample(
         raise ValueError("data_b must be 1D or 2D.")
 
     # Resample according to method
-    # TODO: consider whether to support NaNs, see previous implementation at 
+    # TODO: consider whether to support NaNs, see previous implementation at
+    # https://github.com/NSBLab/neuromodes/blob/3f1b773772ff916eff66daf5664e88324863f197/neuromodes/nulls.py#L391
     match method:
         case 'mean':
             data_a = demeanw(data_a, ved.mass) + meanw(data_b, ved.mass, keepdims=True)
@@ -759,6 +773,14 @@ def resample(
             data_b_sorted = np.sort(data_b, axis=0)
             data_a_ranks = np.argsort(np.argsort(data_a, axis=0), axis=0)
             data_a = np.take_along_axis(data_b_sorted, data_a_ranks, axis=0)
+        case 'qnorm':
+            data_a_ranks = np.argsort(np.argsort(data_a, axis=0), axis=0)
+            data_a_ranks = (data_a_ranks + 1) / (data_a.shape[0] + 1)  # avoids 0 and 1
+            data_a_stdnorm = norm.ppf(data_a_ranks)
+            data_a = (zscorew(data_a_stdnorm, ved.mass) * stdw(data_b, ved.mass, keepdims=True)
+                      + meanw(data_b, ved.mass, keepdims=True))
+        case _:
+            raise ValueError(f"Unknown method: {method}")
 
     return data_a.reshape(data_a_shape) if data_a_shape != data_a.shape else data_a
 
