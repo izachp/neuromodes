@@ -4,6 +4,7 @@ Module for validating and manipulating meshes of brain structures.
 
 from __future__ import annotations
 
+from importlib.util import find_spec
 from pathlib import Path
 from typing import TYPE_CHECKING
 from warnings import warn
@@ -15,6 +16,7 @@ from nibabel.gifti.gifti import GiftiImage
 from nibabel.loadsave import load
 from nibabel.nifti1 import Nifti1Image
 from scipy.interpolate import RBFInterpolator, griddata
+from scipy.ndimage import binary_closing
 from scipy.sparse.linalg import splu
 
 from neuromodes.io import fs_extensions
@@ -383,23 +385,21 @@ def nifti_to_tetmesh(
     **rbf_kwargs
 ) -> NDArray[np.floating]:
     """
-    Project data from volumetric NIFTI space to a tetrahedral mesh using RBF interpolation.
-    
-    RBF (Radial Basis Function) interpolation is faster than griddata's linear method but
-    more stable than nearest-neighbor on mesh boundaries. This avoids the zeros at boundary
-    voxels that nearest-neighbor produces while being much faster than linear griddata.
+    Project data from volumetric NIFTI space to a tetrahedral mesh using linear interpolation and
+    radial basis functions for extrapolation.
     
     Parameters
     ----------
     nifti_data : str, Path, or Nifti1Image
-        Input NIFTI file path or loaded Nifti1Image object.
+        Input NIFTI file path or loaded ``Nifti1Image`` object.
     nifti_mask : str, Path, or Nifti1Image or None
-        Optional mask to define the region of interest. If None, nonzero voxels are used.
+        Optional mask to define the region of interest. If ``None``, nonzero voxels are used.
+        Default is ``None``.
     tetmesh : lapy.TetMesh
         The tetrahedral mesh to which data is projected.
     **rbf_kwargs
-        Additional keyword arguments to pass to `scipy.interpolate.RBFInterpolator`, such as 
-        `function` and `smooth`.
+        Additional keyword arguments to pass to ``scipy.interpolate.RBFInterpolator``, such as 
+        ``function`` and ``smooth``.
     
     Returns
     -------
@@ -441,14 +441,52 @@ def make_vol_mesh(
     vol: str | Path | Nifti1Image,
     closings: int = 0,
     discard_components: bool = False,
-    method: str = 'gmsh',
     **tetgen_kwargs
 ) -> TetMesh:
     """
-    Tetrahedral meshing using Gmsh's python API and marching cubes algorithm.
-    Returns a lapy.TetMesh object.
+    Tetrahedral meshing from a binary voxel mask NIFTI via marching cubes and Delaunay
+    tetrahedralization.
+
+    Parameters
+    ----------
+    vol : str, Path, or Nifti1Image
+        Input NIFTI file path or loaded Nifti1Image object containing a binary mask of the region of
+        interest (ROI).
+    closings : int, optional
+        Number of binary closing operations to perform on the ROI mask before meshing. This can help
+        fill small holes and merge disconnected pieces in the ROI. Default is ``0``.
+    discard_components : bool, optional
+        If True, only the largest connected component of the generated surface mesh will be kept, 
+        discarding the rest. This can be useful for removing small, irrelevant pieces from the mesh.
+        Default is ``False``.
+    **tetgen_kwargs
+        Additional keyword arguments to pass to the `tetgen.TetGen.tetrahedralize`.
+
+    Returns
+    -------
+    lapy.TetMesh
+        The generated tetrahedral mesh of the ROI.
+
+    Raises
+    ------
+    ImportError
+        If the required packages `skimage` and `tetgen` are not installed.
+    TypeError
+        If ``vol`` is not a Nifti1Image object or a path-like string to a valid `.nii` or `.nii.gz`
+        file.
+    ValueError
+        If ``closings`` is not a non-negative integer.
+    ValueError
+        If the generated surface mesh from marching cubes is not closed.
+    ValueError
+        If the generated surface mesh from marching cubes is not manifold.
+        
     """
-    from scipy.ndimage import binary_closing
+    # Import optional dependencies
+    if find_spec("skimage.measure") is None or find_spec("tetgen") is None:
+        raise ImportError("The `skimage` and `tetgen` packages are required for this function. "
+                          "Please ensure they are installed in your environment (e.g., pip install "
+                          "neuromodes[vol]).")
     from skimage.measure import marching_cubes
     from tetgen import TetGen
 
@@ -498,59 +536,16 @@ def make_vol_mesh(
                          "than two faces. Consider using `closings` to fill small holes and merge "
                          "disconnected pieces.")
         
-    if method == 'gmsh':
-        import gmsh
-        gmsh.initialize()
-        gmsh.model.add("vol")
+    # Append vertices from marching cubes with voxel centers
+    vox_coords = np.column_stack(np.nonzero(roi))
+    vox_coords = apply_affine(vol.affine, vox_coords)
+    init_verts = np.vstack([surf.v, vox_coords])
 
-        # Add surface vertices
-        vert_tags = [gmsh.model.geo.addPoint(x, y, z) for x, y, z in surf.v]
-        tria_tags = []
-        for tria in surf.t:
-            e1 = gmsh.model.geo.addLine(vert_tags[tria[0]], vert_tags[tria[1]])
-            e2 = gmsh.model.geo.addLine(vert_tags[tria[1]], vert_tags[tria[2]])
-            e3 = gmsh.model.geo.addLine(vert_tags[tria[2]], vert_tags[tria[0]])
-
-            cl = gmsh.model.geo.addCurveLoop([e1, e2, e3])
-            s = gmsh.model.geo.addPlaneSurface([cl])
-            tria_tags.append(s)
-
-        sl = gmsh.model.geo.addSurfaceLoop(tria_tags)
-        gmsh.model.geo.addVolume([sl])
-        gmsh.model.geo.synchronize()
-
-        # Set mesh options according to BrainEigenmodes
-        gmsh.option.setNumber("Mesh.Algorithm3D", 4)
-        gmsh.option.setNumber("Mesh.Optimize", 1)
-        gmsh.option.setNumber("Mesh.OptimizeNetgen", 1)
-        gmsh.model.mesh.generate(3)
-
-        # Get mesh data
-        verts = gmsh.model.mesh.getNodes()[1].reshape(-1, 3)
-        etypes, _, elems = gmsh.model.mesh.getElements()
-        tetras = None
-        for etype, nodes in zip(etypes, elems):
-            if etype == 4:  # Gmsh tetrahedron element type
-                tetras = nodes.reshape(-1, 4) - 1  # Convert to 0-based indexing
-                break
-
-        # Cleanup API
-        gmsh.finalize()
-
-        if tetras is None:
-            raise RuntimeError("Gmsh did not generate any tetrahedra. Check if the input surface is"
-                               "closed and valid.")
-    elif method == 'tetgen':
-        # Append vertices from marching cubes with voxel centers
-        vox_coords = np.column_stack(np.nonzero(roi))
-        vox_coords = apply_affine(vol.affine, vox_coords)
-        init_verts = np.vstack([surf.v, vox_coords])
-
-        # Generate edges to complete tetrahedral mesh
-        tetgen = TetGen(init_verts, surf.t)
-        tetgen.tetrahedralize(**tetgen_kwargs)
-        verts = tetgen.node
-        tetras = tetgen.elem
+    # Generate edges to complete tetrahedral mesh
+    tetgen = TetGen(init_verts, surf.t)
+    tetgen.tetrahedralize(**tetgen_kwargs)
+    verts = tetgen.node
+    tetras = tetgen.elem
 
     # Convert to lapy
     mesh = TetMesh(v=verts.astype(np.float64), t=tetras.astype(np.int32))
